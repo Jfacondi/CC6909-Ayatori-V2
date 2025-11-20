@@ -1,0 +1,38 @@
+# Requirements translated from environment.yml (conda -> pip equivalents)
+black
+invoke
+jupyterlab
+jupyter
+lightgbm
+matplotlib
+missingno
+nbdime
+numpy
+pandas
+pandas-flavor
+# pandas-profiling was renamed to ydata-profiling
+ydata-profiling
+plotly
+pyjanitor
+pylint
+pyprojroot
+pyspark
+python-dotenv
+scikit-learn
+seaborn
+statsmodels
+# Visualization
+folium
+# ML frameworks
+tensorflow
+keras
+# GTFS and transport data
+pygtfs
+# OSM and graph tools (note: graph-tool can be complex, consider networkx as fallback)
+pyrosm
+networkx
+geopy
+# Packaging helpers
+pip>=23.0
+setuptools
+wheel
