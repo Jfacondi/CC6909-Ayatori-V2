@@ -6,9 +6,8 @@ from typing import (
     Iterable,
 )
 
-def make_dir_function(
-    dir_name: Union[str, Iterable[str]]
-) -> Callable[..., Path]:
+
+def make_dir_function(dir_name: Union[str, Iterable[str]]) -> Callable[..., Path]:
     """Generate a fucntion that converts a string or iterable of strings into
     a path relative to the project directory.
 
@@ -32,19 +31,20 @@ def make_dir_function(
 
     return dir_path
 
+
 project_dir = make_dir_function("")
 
 for dir_type in [
-        ["data"],
-        ["data", "raw"],
-        ["data", "processed"],
-        ["data", "interim"],
-        ["data", "external"],
-        ["models"],
-        ["notebooks"],
-        ["references"],
-        ["reports"],
-        ["reports", "figures"]
-    ]:
-    dir_var = '_'.join(dir_type) + "_dir"
+    ["data"],
+    ["data", "raw"],
+    ["data", "processed"],
+    ["data", "interim"],
+    ["data", "external"],
+    ["models"],
+    ["notebooks"],
+    ["references"],
+    ["reports"],
+    ["reports", "figures"],
+]:
+    dir_var = "_".join(dir_type) + "_dir"
     exec(f"{dir_var} = make_dir_function({dir_type})")

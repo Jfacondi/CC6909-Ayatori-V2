@@ -3,10 +3,12 @@ import os
 import pandas as pd
 from math import *
 from datetime import datetime, date, time, timedelta
-from graph_tool.all import Graph
+import networkx as nx
+from ..utils.gtfs_cleaner import clean_gtfs_stops
+
 
 class GTFSData:
-    def __init__(self, GTFS_PATH='gtfs.zip'):
+    def __init__(self, GTFS_PATH="gtfs.zip"):
         self.scheduler = self.create_scheduler(GTFS_PATH)
         self.graphs = {}
         self.route_stops = {}
@@ -25,9 +27,34 @@ class GTFSData:
         Returns:
         pygtfs.Schedule: the scheduler object
         """
-        scheduler = pygtfs.Schedule(":memory:")
-        pygtfs.append_feed(scheduler, GTFS_PATH)
-        return scheduler
+        import warnings
+        import logging
+        
+        # Suprimir advertencias de pygtfs sobre paradas inválidas
+        logging.getLogger('pygtfs').setLevel(logging.ERROR)
+        warnings.filterwarnings('ignore')
+        
+        gtfs_to_use = GTFS_PATH
+        
+        # Intentar cargar GTFS directamente
+        try:
+            scheduler = pygtfs.Schedule(":memory:")
+            pygtfs.append_feed(scheduler, GTFS_PATH)
+            return scheduler
+        except (TypeError, ValueError) as e:
+            # Si falla por coordenadas None, intentar limpiar el GTFS
+            if "float()" in str(e) and "NoneType" in str(e):
+                print("⚠️  GTFS con paradas sin coordenadas detectado, limpiando...")
+                try:
+                    gtfs_to_use = clean_gtfs_stops(GTFS_PATH)
+                    scheduler = pygtfs.Schedule(":memory:")
+                    pygtfs.append_feed(scheduler, str(gtfs_to_use))
+                    return scheduler
+                except Exception as clean_error:
+                    print(f"❌ Error al limpiar GTFS: {clean_error}")
+                    raise
+            else:
+                raise
 
     def get_gtfs_data(self):
         """
@@ -43,29 +70,18 @@ class GTFSData:
         sched = self.scheduler
 
         # Get special calendar dates
-        for cal_date in sched.service_exceptions: # Calendar_dates is renamed in pygtfs
+        for cal_date in sched.service_exceptions:  # Calendar_dates is renamed in pygtfs
             self.special_dates.append(cal_date.date.strftime("%d/%m/%Y"))
 
-        stop_id_map = {} # To assign unique ids to every stop
+        stop_id_map = {}  # To assign unique ids to every stop
         stop_coords = {}
 
         for route in sched.routes:
-            graph = Graph(directed=True)
+            graph = nx.DiGraph()
             stop_ids = set()
             trips = [trip for trip in sched.trips if trip.route_id == route.route_id]
 
-            # Create a new vertex property for node_id
-            node_id_prop = graph.new_vertex_property("string")
-
-            # Create edge properties
-            u_prop = graph.new_edge_property("object")
-            v_prop = graph.new_edge_property("object")
-            weight_prop = graph.new_edge_property("int")
-            graph.edge_properties["weight"] = weight_prop
-            graph.edge_properties["u"] = u_prop
-            graph.edge_properties["v"] = v_prop
-
-            added_edges = set() # To keep track of the edges that have already been added
+            added_edges = set()  # To keep track of the edges that have already been added
 
             for trip in trips:
                 stop_times = trip.stop_times
@@ -76,39 +92,51 @@ class GTFSData:
                     sequence = stop_times[i].stop_sequence
 
                     if stop_id not in stop_id_map:
-                        vertex = graph.add_vertex()
+                        vertex = stop_id  # Use stop_id directly as node identifier
                         stop_id_map[stop_id] = vertex
                     else:
                         vertex = stop_id_map[stop_id]
 
                     stop_ids.add(vertex)
-
-                    # Assign the node_id property to the vertex
-                    node_id_prop[vertex] = stop_id
+                    # Add node to graph if it doesn't exist
+                    if vertex not in graph:
+                        graph.add_node(vertex, stop_id=stop_id)
 
                     if i < len(stop_times) - 1:
                         next_stop_id = stop_times[i + 1].stop_id
 
                         if next_stop_id not in stop_id_map:
-                            next_vertex = graph.add_vertex()
+                            next_vertex = next_stop_id
                             stop_id_map[next_stop_id] = next_vertex
                         else:
                             next_vertex = stop_id_map[next_stop_id]
 
                         edge = (vertex, next_vertex)
-                        if edge not in added_edges: # Check if the edge has already been added
-                            e = graph.add_edge(*edge)
-                            graph.edge_properties["weight"][e] = 1
-                            graph.edge_properties["u"][e] = node_id_prop[vertex]
-                            graph.edge_properties["v"][e] = node_id_prop[next_vertex]
-                            added_edges.add(edge) # Add the edge to the set of added edges
+                        if edge not in added_edges:  # Check if the edge has already been added
+                            graph.add_edge(vertex, next_vertex, weight=1, u=vertex, v=next_vertex)
+                            added_edges.add(edge)  # Add the edge to the set of added edges
 
                         if route.route_id not in stop_coords:
                             stop_coords[route.route_id] = {}
 
                         if stop_id not in stop_coords[route.route_id]:
                             stop = sched.stops_by_id(stop_id)[0]
-                            stop_coords[route.route_id][stop_id] = (stop.stop_lon, stop.stop_lat)
+                            
+                            # Validar que la parada tiene coordenadas válidas
+                            if stop.stop_lat is None or stop.stop_lon is None:
+                                continue  # Saltar paradas sin coordenadas
+                            
+                            try:
+                                lat = float(stop.stop_lat)
+                                lon = float(stop.stop_lon)
+                                
+                                # Validar rango geográfico
+                                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                                    continue
+                                    
+                                stop_coords[route.route_id][stop_id] = (lon, lat)
+                            except (ValueError, TypeError):
+                                continue  # Saltar paradas con coordenadas inválidas
 
                             if route.route_id not in self.route_stops:
                                 self.route_stops[route.route_id] = {}
@@ -119,16 +147,16 @@ class GTFSData:
                                 "coordinates": stop_coords[route.route_id][stop_id],
                                 "orientation": "round" if orientation == "I" else "return",
                                 "sequence": sequence,
-                                "arrival_times": []
+                                "arrival_times": [],
                             }
 
                     arrival_time = (datetime.min + stop_times[i].arrival_time).time()
 
-                    if stop_id in self.route_stops[route.route_id]:
-                        self.route_stops[route.route_id][stop_id]["arrival_times"].append(arrival_time)
-
-            # Assign the node_id property to the graph
-            graph.vertex_properties["node_id"] = node_id_prop
+                    # Solo agregar tiempo de llegada si la parada es válida
+                    if stop_id in self.route_stops.get(route.route_id, {}):
+                        self.route_stops[route.route_id][stop_id]["arrival_times"].append(
+                            arrival_time
+                        )
 
             self.graphs[route.route_id] = graph
 
@@ -156,7 +184,7 @@ class GTFSData:
                             "coordinates": stop_coords[route.route_id][stop_id],
                             "orientation": "round",
                             "sequence": sequence,
-                            "arrival_times": []
+                            "arrival_times": [],
                         }
 
             for stop_id in return_trip_stops:
@@ -170,22 +198,15 @@ class GTFSData:
                             "coordinates": stop_coords[route.route_id][stop_id],
                             "orientation": "return",
                             "sequence": sequence,
-                            "arrival_times": []
+                            "arrival_times": [],
                         }
 
         for route_id, graph in self.graphs.items():
-            weight_prop = graph.new_edge_property("int")
-
-            for e in graph.edges():
-                weight_prop[e] = 1
-
-            graph.edge_properties["weight"] = weight_prop
-
             data_dir = "gtfs_routes"
             if not os.path.exists(data_dir):
                 os.makedirs(data_dir)
 
-            graph.save(f"{data_dir}/{route_id}.gt")
+            # graph.save(f"{data_dir}/{route_id}.gt")  # Legacy: graph-tool method (not available in networkx)
 
         print("GTFS DATA RECEIVED SUCCESSFULLY")
 
@@ -214,15 +235,13 @@ class GTFSData:
 
         graph = self.graphs[route_id]
         vertices = []
-        for v in graph.vertices():
-            node_id = graph.vertex_properties["node_id"][v]
-            if node_id != '' and node_id is not None:
+        for v in graph.nodes():
+            node_id = v
+            if node_id != "" and node_id is not None:
                 vertices.append(node_id)
 
         edges = []
-        for e in graph.edges():
-            u = graph.edge_properties["u"][e]
-            v = graph.edge_properties["v"][e]
+        for u, v in graph.edges():
             if u is not None and v is not None:
                 edges.append((u, v))
 
@@ -243,7 +262,7 @@ class GTFSData:
             return None
 
         graph = self.graphs[route_id]
-        vertices = [graph.vertex_properties["node_id"][v] for v in graph.vertices()]
+        vertices = [v for v in graph.nodes()]
 
         return vertices
 
@@ -262,7 +281,7 @@ class GTFSData:
             return None
 
         graph = self.graphs[route_id]
-        edges = [(graph.edge_properties["u"][e], graph.edge_properties["v"][e]) for e in graph.edges()]
+        edges = [(u, v) for u, v in graph.edges()]
 
         return edges
 
@@ -281,9 +300,27 @@ class GTFSData:
         map = folium.Map(location=[-33.45, -70.65], zoom_start=12)
 
         # List of valid colors
-        map_colors= ['red', 'orange', 'darkred', 'blue', 'lightblue', 'green', 'purple', 'lightred', 'beige',
-                     'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'white', 'pink', 'lightgreen',
-                     'gray', 'black', 'lightgray']
+        map_colors = [
+            "red",
+            "orange",
+            "darkred",
+            "blue",
+            "lightblue",
+            "green",
+            "purple",
+            "lightred",
+            "beige",
+            "darkblue",
+            "darkgreen",
+            "cadetblue",
+            "darkpurple",
+            "white",
+            "pink",
+            "lightgreen",
+            "gray",
+            "black",
+            "lightgray",
+        ]
 
         color_id = 0
         for route_id in route_list:
@@ -292,23 +329,37 @@ class GTFSData:
 
             # Filter the stops that are visited on the round trip
             if orientation_flag:
-                trip_stops = [stop_info for stop_info in stops.values() if stop_info["orientation"] == "round"]
+                trip_stops = [
+                    stop_info for stop_info in stops.values() if stop_info["orientation"] == "round"
+                ]
             else:
-                trip_stops = [stop_info for stop_info in stops.values() if stop_info["orientation"] == "return"]
+                trip_stops = [
+                    stop_info
+                    for stop_info in stops.values()
+                    if stop_info["orientation"] == "return"
+                ]
 
             # Sort the stops by their sequence number in the trip
-            trip_stops = sorted(trip_stops, key=lambda x: x['sequence'])
+            trip_stops = sorted(trip_stops, key=lambda x: x["sequence"])
 
-            folium.PolyLine(locations=[[stop_info["coordinates"][1], stop_info["coordinates"][0]] for stop_info in trip_stops],
-                            color=map_colors[color_id], weight=4).add_to(map)
+            folium.PolyLine(
+                locations=[
+                    [stop_info["coordinates"][1], stop_info["coordinates"][0]]
+                    for stop_info in trip_stops
+                ],
+                color=map_colors[color_id],
+                weight=4,
+            ).add_to(map)
 
             if stops_flag:
                 for stop_info in trip_stops:
-                    folium.Marker(location=[stop_info["coordinates"][1], stop_info["coordinates"][0]], popup=stop_info["stop_id"],
-                                   icon=folium.Icon(color='lightgray', icon='minus')).add_to(map)
+                    folium.Marker(
+                        location=[stop_info["coordinates"][1], stop_info["coordinates"][0]],
+                        popup=stop_info["stop_id"],
+                        icon=folium.Icon(color="lightgray", icon="minus"),
+                    ).add_to(map)
 
-
-            color_id+=1
+            color_id += 1
 
         return map
 
@@ -324,8 +375,14 @@ class GTFSData:
         round_trip_stops.sort(key=lambda stop: stop["sequence"])
         return_trip_stops.sort(key=lambda stop: stop["sequence"])
 
-        round_trip_coords = [(stop_info["coordinates"][1], stop_info["coordinates"][0]) for stop_info in round_trip_stops]
-        return_trip_coords = [(stop_info["coordinates"][1], stop_info["coordinates"][0]) for stop_info in return_trip_stops]
+        round_trip_coords = [
+            (stop_info["coordinates"][1], stop_info["coordinates"][0])
+            for stop_info in round_trip_stops
+        ]
+        return_trip_coords = [
+            (stop_info["coordinates"][1], stop_info["coordinates"][0])
+            for stop_info in return_trip_stops
+        ]
 
         return round_trip_coords, return_trip_coords
 
@@ -347,7 +404,7 @@ class GTFSData:
         dLon = radians(lon2 - lon1)
         lat1 = radians(lat1)
         lat2 = radians(lat2)
-        a = sin(dLat / 2)**2 + cos(lat1) * cos(lat2) * sin(dLon / 2)**2
+        a = sin(dLat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dLon / 2) ** 2
         c = 2 * asin(sqrt(a))
         return R * c
 
@@ -422,7 +479,7 @@ class GTFSData:
         bool: True if the stop ID is on the given route, False otherwise.
         """
         stop_list = self.get_route_stop_ids(route_id)
-        return (stop_id in stop_list)
+        return stop_id in stop_list
 
     def is_route_near_coordinates(self, route_id, coordinates, margin):
         """
@@ -439,7 +496,9 @@ class GTFSData:
         """
         for stop_info in self.route_stops[route_id].values():
             stop_coords = stop_info["coordinates"]
-            distance = self.haversine(coordinates[1], coordinates[0], stop_coords[1], stop_coords[0])
+            distance = self.haversine(
+                coordinates[1], coordinates[0], stop_coords[1], stop_coords[0]
+            )
             if distance <= margin:
                 return route_id
         return False
@@ -456,7 +515,9 @@ class GTFSData:
         str or list: The bus orientation(s) associated with the route_id and stop_id. None if nothing is found.
         """
         stop_times = pd.read_csv("stop_times.txt")
-        filtered_stop_times = stop_times[(stop_times["trip_id"].str.startswith(route_id)) & (stop_times["stop_id"] == stop_id)]
+        filtered_stop_times = stop_times[
+            (stop_times["trip_id"].str.startswith(route_id)) & (stop_times["stop_id"] == stop_id)
+        ]
 
         orientations = []
         for trip_id in filtered_stop_times["trip_id"]:
@@ -502,7 +563,12 @@ class GTFSData:
         Returns:
         list: A list of route IDs that have a stop at the given stop ID.
         """
-        routes = [route_id for route_id in self.route_stops.keys() if stop_id in self.get_route_stop_ids(route_id) and self.connection_finder(stop_id, stop_id)]
+        routes = [
+            route_id
+            for route_id in self.route_stops.keys()
+            if stop_id in self.get_route_stop_ids(route_id)
+            and self.connection_finder(stop_id, stop_id)
+        ]
         return routes
 
     def is_24_hour_service(self, route_id):
@@ -545,8 +611,12 @@ class GTFSData:
         list: A list of route IDs that are night routes if is_nighttime is True, or all route IDs otherwise.
         """
         if is_nighttime:
-            #nighttime_routes = [route_id for route_id in valid_services if route_id.endswith("N")]
-            nighttime_routes = [route_id for route_id in valid_services if route_id.endswith("N") or self.is_24_hour_service(route_id)]
+            # nighttime_routes = [route_id for route_id in valid_services if route_id.endswith("N")]
+            nighttime_routes = [
+                route_id
+                for route_id in valid_services
+                if route_id.endswith("N") or self.is_24_hour_service(route_id)
+            ]
             if nighttime_routes:
                 return nighttime_routes
             else:
@@ -610,7 +680,10 @@ class GTFSData:
         am_end_time = time(9, 0, 0)
         pm_start_time = time(17, 30, 0)
         pm_end_time = time(21, 0, 0)
-        if am_start_time <= source_hour <= am_end_time or pm_start_time <= source_hour <= pm_end_time:
+        if (
+            am_start_time <= source_hour <= am_end_time
+            or pm_start_time <= source_hour <= pm_end_time
+        ):
             return True
         else:
             return False
@@ -629,7 +702,9 @@ class GTFSData:
         if is_rush_hour:
             return valid_services
         else:
-            regular_hour_routes = [route_id for route_id in valid_services if not route_id.endswith("e")]
+            regular_hour_routes = [
+                route_id for route_id in valid_services if not route_id.endswith("e")
+            ]
             return regular_hour_routes
 
     def get_trip_day_suffix(self, date):
@@ -687,8 +762,12 @@ class GTFSData:
             headway_secs = row["headway_secs"]
             round_trip_id = f"{route_id}-I-{day_suffix}"
             return_trip_id = f"{route_id}-R-{day_suffix}"
-            round_stop_times = pd.read_csv("stop_times.txt").query(f"trip_id.str.startswith('{round_trip_id}') and stop_id == '{stop_id}'")
-            return_stop_times = pd.read_csv("stop_times.txt").query(f"trip_id.str.startswith('{return_trip_id}') and stop_id == '{stop_id}'")
+            round_stop_times = pd.read_csv("stop_times.txt").query(
+                f"trip_id.str.startswith('{round_trip_id}') and stop_id == '{stop_id}'"
+            )
+            return_stop_times = pd.read_csv("stop_times.txt").query(
+                f"trip_id.str.startswith('{return_trip_id}') and stop_id == '{stop_id}'"
+            )
             if len(round_stop_times) == 0 and len(return_stop_times) == 0:
                 return
             elif len(round_stop_times) > 0:
@@ -700,13 +779,14 @@ class GTFSData:
             for freq_time in pd.date_range(start_time, end_time, freq=f"{headway_secs}s"):
                 freq_time_str = freq_time.strftime("%H:%M:%S")
                 freq_time = datetime.strptime(freq_time_str, "%H:%M:%S")
-                stop_route_time = datetime.combine(datetime.min, stop_time.time()) + timedelta(seconds=(freq_time - datetime.min).seconds)
+                stop_route_time = datetime.combine(datetime.min, stop_time.time()) + timedelta(
+                    seconds=(freq_time - datetime.min).seconds
+                )
                 if stop_route_time not in stop_route_times:
                     stop_route_times.append(stop_route_time)
                 stop_time += pd.Timedelta(seconds=headway_secs)
 
         return bus_orientation, stop_route_times
-
 
     def get_time_until_next_bus(self, arrival_times, source_hour, source_date):
         """
@@ -724,7 +804,7 @@ class GTFSData:
         for a_time in arrival_times:
             if a_time.time() >= source_hour:
                 arrival_times_remaining.append(a_time)
-        #arrival_times_remaining = [time for time in arrival_times if time.time() >= source_hour]
+        # arrival_times_remaining = [time for time in arrival_times if time.time() >= source_hour]
         if len(arrival_times_remaining) == 0:
             return None
         else:
@@ -744,7 +824,9 @@ class GTFSData:
                 # Calculate the time until the next three buses
                 time_until_next_buses = []
                 for next_bus in next_buses:
-                    time_until_next_bus = (next_bus - datetime.combine(next_bus.date(), source_hour)).total_seconds()
+                    time_until_next_bus = (
+                        next_bus - datetime.combine(next_bus.date(), source_hour)
+                    ).total_seconds()
                     minutes, seconds = divmod(time_until_next_bus, 60)
                     time_until_next_buses.append((int(minutes), int(seconds)))
 
@@ -791,10 +873,15 @@ class GTFSData:
         Returns:
         timedelta: A timedelta object representing the travel time.
         """
-        stop_times = pd.read_csv("stop_times.txt").query(f"trip_id.str.startswith('{trip_id}') and stop_id in {stop_ids}")
+        stop_times = pd.read_csv("stop_times.txt").query(
+            f"trip_id.str.startswith('{trip_id}') and stop_id in {stop_ids}"
+        )
         if len(stop_times) < 2:
             return None
-        arrival_times = [datetime.strptime(arrival_time, "%H:%M:%S") for arrival_time in stop_times["arrival_time"]]
+        arrival_times = [
+            datetime.strptime(arrival_time, "%H:%M:%S")
+            for arrival_time in stop_times["arrival_time"]
+        ]
         travel_time = arrival_times[1] - arrival_times[0]
         return travel_time
 
@@ -817,16 +904,190 @@ class GTFSData:
         Calculates the walking travel time between a location and a stop, given a speed value.
 
         Parameters:
-        stop_coords (tuple): A tuple with the stop's coordinates.
-        location_coords (tuple):  A tuple with the location's coordinates.
-        speed (float): The walking speed value.
+        stop_coords (tuple): A tuple with the stop's coordinates (lat, lon).
+        location_coords (tuple):  A tuple with the location's coordinates (lat, lon).
+        speed (float): The walking speed value in km/h.
 
         Returns.
         float: The time (in seconds) that represents the travel time.
         """
-        distance = self.haversine(stop_coords[0], stop_coords[1], location_coords[0], location_coords[1])
-        time = round((distance / speed) * 3600,2)
+        # Extract lat/lon from tuples (order: lat, lon)
+        stop_lat, stop_lon = stop_coords
+        location_lat, location_lon = location_coords
+        
+        # Call haversine with correct parameter order: lon1, lat1, lon2, lat2
+        distance = self.haversine(stop_lon, stop_lat, location_lon, location_lat)
+        
+        time = round((distance / speed) * 3600, 2)
         return time
+
+    def get_nearby_stops(self, location_coords, margin_km=0.5, max_stops=10):
+        """
+        Finds stops within a given distance margin from a location.
+
+        Parameters:
+        location_coords (tuple): A tuple with the location's coordinates (lat, lon).
+        margin_km (float): The maximum distance in kilometers to search for stops. Default is 0.5 km.
+        max_stops (int): Maximum number of stops to return. Default is 10.
+
+        Returns:
+        list: A list of tuples (stop_id, distance_km) sorted by distance, closest first.
+        """
+        nearby_stops = []
+        lat, lon = location_coords
+        
+        # Iterate through all stops in the GTFS data
+        for stop in self.scheduler.stops:
+            if stop.stop_lat is not None and stop.stop_lon is not None:
+                # Calculate distance using haversine
+                distance = self.haversine(lon, lat, stop.stop_lon, stop.stop_lat)
+                
+                # If within margin, add to list
+                if distance <= margin_km:
+                    nearby_stops.append((stop.stop_id, distance))
+        
+        # Sort by distance (closest first)
+        nearby_stops.sort(key=lambda x: x[1])
+        
+        # Return at most max_stops
+        return nearby_stops[:max_stops]
+
+    def find_nearby_routes(self, stop_id: str, margin_km: float = 0.5):
+        """
+        Encuentra otras rutas con paradas cercanas a una parada dada.
+        
+        Args:
+            stop_id: ID de la parada de referencia
+            margin_km: Radio de búsqueda en kilómetros (default: 0.5 km)
+            
+        Returns:
+            dict: {route_id: [(nearby_stop_id, distance_km), ...]}
+        """
+        # Obtener coordenadas de la parada de referencia
+        stop_coords = self.get_stop_coords(stop_id)
+        if stop_coords is None:
+            return {}
+        
+        # Encontrar paradas cercanas
+        nearby_stops = self.get_nearby_stops(
+            (stop_coords[1], stop_coords[0]),  # get_nearby_stops espera (lat, lon)
+            margin_km=margin_km,
+            max_stops=50  # Buscar más paradas para encontrar más rutas
+        )
+        
+        # Agrupar por ruta
+        routes_nearby = {}
+        for nearby_stop_id, distance in nearby_stops:
+            # Saltar la misma parada
+            if nearby_stop_id == stop_id:
+                continue
+            
+            # Encontrar rutas que pasan por esta parada cercana
+            for route_id, stops_dict in self.route_stops.items():
+                if nearby_stop_id in stops_dict:
+                    if route_id not in routes_nearby:
+                        routes_nearby[route_id] = []
+                    routes_nearby[route_id].append((nearby_stop_id, distance))
+        
+        # Ordenar paradas por distancia para cada ruta
+        for route_id in routes_nearby:
+            routes_nearby[route_id].sort(key=lambda x: x[1])
+        
+        return routes_nearby
+
+    def compute_all_transfers(self, max_distance_km: float = 0.5, 
+                              max_waiting_minutes: int = 15,
+                              walking_speed_kmh: float = 5.0):
+        """
+        Calcula todas las transferencias posibles entre rutas.
+        
+        Args:
+            max_distance_km: Distancia máxima de caminata para transbordo (default: 0.5 km)
+            max_waiting_minutes: Tiempo máximo de espera (default: 15 minutos)
+            walking_speed_kmh: Velocidad de caminata (default: 5 km/h)
+            
+        Returns:
+            TransferManager: Objeto con todas las transferencias calculadas
+        """
+        from .TransferConnection import TransferConnection, TransferManager
+        
+        transfer_manager = TransferManager()
+        transfer_count = 0
+        
+        print(f"Calculando transferencias para {len(self.route_stops)} rutas...")
+        
+        # Para cada ruta
+        for from_route_id, stops_dict in self.route_stops.items():
+            # Para cada parada de la ruta
+            for from_stop_id in stops_dict.keys():
+                # Encontrar rutas cercanas
+                nearby_routes = self.find_nearby_routes(from_stop_id, margin_km=max_distance_km)
+                
+                # Crear transferencias
+                for to_route_id, nearby_stops in nearby_routes.items():
+                    # Evitar transferencias a la misma ruta
+                    if from_route_id == to_route_id:
+                        continue
+                    
+                    # Para cada parada cercana de la ruta destino
+                    for to_stop_id, distance in nearby_stops[:3]:  # Top 3 más cercanas
+                        # Calcular tiempo de caminata
+                        walking_time = (distance / walking_speed_kmh) * 3600  # segundos
+                        
+                        # Determinar tipo de transbordo
+                        if from_stop_id == to_stop_id:
+                            transfer_type = 'same_stop'
+                        elif distance < 0.05:  # Menos de 50 metros
+                            transfer_type = 'nearby'
+                        else:
+                            transfer_type = 'walking'
+                        
+                        # Crear transferencia
+                        transfer = TransferConnection(
+                            from_route_id=from_route_id,
+                            to_route_id=to_route_id,
+                            from_stop_id=from_stop_id,
+                            to_stop_id=to_stop_id,
+                            walking_distance_km=distance,
+                            walking_time_seconds=walking_time,
+                            min_transfer_time=max(120, int(walking_time)),  # Mínimo 2 minutos
+                            max_waiting_time=max_waiting_minutes * 60,
+                            transfer_type=transfer_type
+                        )
+                        
+                        transfer_manager.add_transfer(transfer)
+                        transfer_count += 1
+        
+        print(f"✅ {transfer_count} transferencias calculadas")
+        stats = transfer_manager.get_statistics()
+        print(f"   - {stats['viable_transfers']} viables ({stats['viability_rate']*100:.1f}%)")
+        print(f"   - {stats['routes_with_transfers']} rutas con transferencias")
+        
+        # Almacenar en la instancia
+        self.transfer_manager = transfer_manager
+        
+        return transfer_manager
+
+    def get_transfer_options(self, route_id: str, stop_id: str, viable_only: bool = True):
+        """
+        Obtiene opciones de transbordo desde una parada de una ruta.
+        
+        Args:
+            route_id: ID de la ruta actual
+            stop_id: ID de la parada actual
+            viable_only: Si True, solo retorna transferencias viables
+            
+        Returns:
+            list: Lista de TransferConnection disponibles
+        """
+        if not hasattr(self, 'transfer_manager'):
+            print("⚠️  Transferencias no calculadas. Ejecute compute_all_transfers() primero.")
+            return []
+        
+        if viable_only:
+            return self.transfer_manager.get_viable_transfers_from(route_id, stop_id)
+        else:
+            return self.transfer_manager.get_transfers_from(route_id, stop_id)
 
     def parse_metro_stations(self, stops_file):
         """
@@ -839,9 +1100,9 @@ class GTFSData:
         dict: A dictionary with the names of the stations.
         """
         subway_stops = {}
-        with open(stops_file, 'r') as f:
+        with open(stops_file, "r") as f:
             for line in f:
-                stop_id, _, stop_name, _, _, _, _ = line.strip().split(',')
+                stop_id, _, stop_name, _, _, _, _ = line.strip().split(",")
                 if stop_id.isdigit():
                     subway_stops[stop_id] = stop_name
         return subway_stops
