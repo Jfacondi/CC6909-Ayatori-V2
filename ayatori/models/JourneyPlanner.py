@@ -186,14 +186,12 @@ class JourneyPlanner:
         origin_stops = self.find_nearby_origin_stops(origin_coords, max_stops=3)
         
         if not origin_stops:
-            print(f"⚠️  No se encontraron paradas cerca del origen (radio {self.max_walking_distance} km)")
             return None
         
         # Paso 2: Encontrar paradas cercanas al destino
         destination_stops = self.find_nearby_destination_stops(destination_coords, max_stops=3)
         
         if not destination_stops:
-            print(f"⚠️  No se encontraron paradas cerca del destino (radio {self.max_walking_distance} km)")
             return None
         
         # Paso 3: Para esta versión básica, usar la parada más cercana al origen
@@ -218,7 +216,6 @@ class JourneyPlanner:
         routes_at_origin = self._find_routes_at_stop(best_origin_stop)
         
         if not routes_at_origin:
-            print(f"⚠️  No se encontraron rutas en parada {best_origin_stop}")
             return None
         
         # Paso 5: Para cada ruta, verificar si llega cerca del destino
@@ -244,7 +241,6 @@ class JourneyPlanner:
                             best_destination_stop = stop_id
         
         if not best_route:
-            print(f"⚠️  No se encontró ruta directa desde {best_origin_stop}")
             # Aquí se implementaría búsqueda con transbordos
             return None
         

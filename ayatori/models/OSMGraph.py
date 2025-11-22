@@ -42,7 +42,6 @@ class OSMGraph(nx.Graph):
 
         graph = nx.Graph()
 
-        print("GETTING OSM NODES...")
         for index, row in nodes.iterrows():
             lon = row["lon"]
             lat = row["lat"]
@@ -53,9 +52,6 @@ class OSMGraph(nx.Graph):
             # Add node with attributes for lon, lat, node_id, and graph_id
             graph.add_node(node_id, lon=lon, lat=lat, graph_id=graph_id)
 
-        print("DONE")
-        print("GETTING OSM EDGES...")
-
         for index, row in edges.iterrows():
             source_node = row["u"]
             target_node = row["v"]
@@ -64,7 +60,6 @@ class OSMGraph(nx.Graph):
                 continue  # Skip edges with empty or missing nodes
 
             if source_node not in graph or target_node not in graph:
-                print(f"Skipping edge with missing nodes: {source_node} -> {target_node}")
                 continue  # Skip edges with missing nodes
 
             # Calculate the distance between the nodes and use it as the weight of the edge
@@ -81,7 +76,6 @@ class OSMGraph(nx.Graph):
                 weight=distance,
             )
 
-        print("OSM DATA HAS BEEN SUCCESSFULLY RECEIVED")
         return graph
 
     def get_nodes_and_edges(self):
@@ -188,16 +182,12 @@ class OSMGraph(nx.Graph):
             except GeocoderServiceError:
                 i = 0
                 if i < 15:
-                    print("Geocoding service error. Retrying in 5 seconds...")
                     tm.sleep(5)
                     i += 1
                 else:
-                    msg = "Error: Too many retries. Geocoding service may be down. Please try again later."
-                    print(msg)
                     return
         if location is not None:
             lat, lon = location.latitude, location.longitude
             nearest = self.find_nearest_node(lat, lon)
             return nearest
-        msg = "Error: Address couldn't be found."
-        print(msg)
+        return None

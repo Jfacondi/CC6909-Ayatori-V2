@@ -106,8 +106,13 @@ class ConnectionScanAlgorithm:
         Returns:
             Lista de Journey ordenados por calidad (mejor primero)
         """
-        print(f"\n🔍 Buscando rutas desde {origin_coords} a {destination_coords}")
-        print(f"   Salida: {departure_time.strftime('%H:%M')}")
+        # Validación de entrada
+        if not isinstance(origin_coords, tuple) or len(origin_coords) != 2:
+            raise ValueError("origin_coords debe ser una tupla (lat, lon)")
+        if not isinstance(destination_coords, tuple) or len(destination_coords) != 2:
+            raise ValueError("destination_coords debe ser una tupla (lat, lon)")
+        if not isinstance(departure_time, datetime):
+            raise ValueError("departure_time debe ser un objeto datetime")
         
         # Paso 1: Encontrar paradas cercanas al origen
         origin_stops = self.gtfs.get_nearby_stops(
@@ -116,10 +121,7 @@ class ConnectionScanAlgorithm:
         )
         
         if not origin_stops:
-            print("❌ No hay paradas cerca del origen")
             return []
-        
-        print(f"   Paradas origen: {len(origin_stops)} encontradas")
         
         # Paso 2: Encontrar paradas cercanas al destino
         destination_stops = self.gtfs.get_nearby_stops(
@@ -128,10 +130,7 @@ class ConnectionScanAlgorithm:
         )
         
         if not destination_stops:
-            print("❌ No hay paradas cerca del destino")
             return []
-        
-        print(f"   Paradas destino: {len(destination_stops)} encontradas")
         
         # Paso 3: Ejecutar CSA para cada combinación de paradas
         all_journeys = []
@@ -158,7 +157,6 @@ class ConnectionScanAlgorithm:
         
         # Paso 4: Ordenar y retornar las mejores rutas
         if not all_journeys:
-            print("❌ No se encontraron rutas válidas")
             return []
         
         # Ordenar por duración total, luego por número de transferencias
@@ -166,8 +164,6 @@ class ConnectionScanAlgorithm:
         
         # Filtrar rutas muy similares (mismas paradas, misma ruta)
         unique_journeys = self._filter_similar_journeys(all_journeys)
-        
-        print(f"✅ {len(unique_journeys)} rutas únicas encontradas")
         
         return unique_journeys[:num_alternatives]
     
@@ -285,6 +281,7 @@ class ConnectionScanAlgorithm:
                                   current_time: datetime) -> List[Tuple[str, datetime]]:
         """
         Obtiene las siguientes paradas en una ruta después de la parada actual.
+        Usa horarios reales del GTFS cuando están disponibles.
         Retorna: [(stop_id, estimated_arrival_time), ...]
         """
         if route_id not in self.gtfs.route_stops:
@@ -296,15 +293,39 @@ class ConnectionScanAlgorithm:
             return []
         
         current_sequence = route_stops[current_stop]['sequence']
+        current_stop_info = route_stops[current_stop]
         
         # Encontrar paradas siguientes en la secuencia
         next_stops = []
+        
+        # Intentar usar arrival_times reales si están disponibles
+        has_arrival_times = 'arrival_times' in current_stop_info and current_stop_info['arrival_times']
+        
         for stop_id, stop_info in route_stops.items():
             if stop_info['sequence'] > current_sequence:
-                # Estimar tiempo de llegada (simplificado)
-                # En una implementación completa, usar horarios reales del GTFS
                 sequence_diff = stop_info['sequence'] - current_sequence
-                estimated_time = current_time + timedelta(minutes=2 * sequence_diff)
+                
+                # Intentar calcular tiempo basado en horarios reales
+                if has_arrival_times and 'arrival_times' in stop_info and stop_info['arrival_times']:
+                    # Buscar el próximo horario después de current_time
+                    current_time_only = current_time.time()
+                    
+                    # Encontrar el próximo horario disponible
+                    next_arrival = None
+                    for arrival_time in sorted(stop_info['arrival_times']):
+                        if arrival_time >= current_time_only:
+                            # Combinar con la fecha de current_time
+                            next_arrival = datetime.combine(current_time.date(), arrival_time)
+                            break
+                    
+                    if next_arrival and next_arrival > current_time:
+                        estimated_time = next_arrival
+                    else:
+                        # Si no hay horarios disponibles, usar estimación
+                        estimated_time = current_time + timedelta(minutes=2 * sequence_diff)
+                else:
+                    # Estimación basada en secuencia (2 minutos por parada)
+                    estimated_time = current_time + timedelta(minutes=2 * sequence_diff)
                 
                 next_stops.append((stop_id, estimated_time))
         

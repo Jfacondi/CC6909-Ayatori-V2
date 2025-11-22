@@ -14,6 +14,7 @@ class GTFSData:
         self.route_stops = {}
         self.special_dates = []
         self.stops = set()
+        self.stop_coords = {}  # Inicializar diccionario de coordenadas
         self.graphs, self.route_stops, self.special_dates = self.get_gtfs_data()
         self.stops = self.get_stop_ids()
 
@@ -44,14 +45,12 @@ class GTFSData:
         except (TypeError, ValueError) as e:
             # Si falla por coordenadas None, intentar limpiar el GTFS
             if "float()" in str(e) and "NoneType" in str(e):
-                print("⚠️  GTFS con paradas sin coordenadas detectado, limpiando...")
                 try:
                     gtfs_to_use = clean_gtfs_stops(GTFS_PATH)
                     scheduler = pygtfs.Schedule(":memory:")
                     pygtfs.append_feed(scheduler, str(gtfs_to_use))
                     return scheduler
                 except Exception as clean_error:
-                    print(f"❌ Error al limpiar GTFS: {clean_error}")
                     raise
             else:
                 raise
@@ -385,46 +384,6 @@ class GTFSData:
         ]
 
         return round_trip_coords, return_trip_coords
-
-    def haversine(self, lon1, lat1, lon2, lat2):
-        """
-        Calculate the great circle distance between two points on the earth (specified in decimal degrees).
-
-        Parameters:
-        lon1 (float): Longitude of the first point in decimal degrees.
-        lat1 (float): Latitude of the first point in decimal degrees.
-        lon2 (float): Longitude of the second point in decimal degrees.
-        lat2 (float): Latitude of the second point in decimal degrees.
-
-        Returns:
-        float: The distance between the two points in kilometers.
-        """
-        R = 6372.8  # Earth radius in kilometers
-        dLat = radians(lat2 - lat1)
-        dLon = radians(lon2 - lon1)
-        lat1 = radians(lat1)
-        lat2 = radians(lat2)
-        a = sin(dLat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dLon / 2) ** 2
-        c = 2 * asin(sqrt(a))
-        return R * c
-
-    def get_stop_coords(self, stop_id):
-        """
-        Given a stop ID, returns the coordinates of the stop with the given ID.
-        If the stop ID is not found, returns None.
-
-        Parameters:
-        stop_id (int): The ID of the stop to get the coordinates for.
-
-        Returns:
-        tuple: A tuple of two floats representing the longitude and latitude of the stop with the given ID.
-        None: If the stop ID is not found.
-        """
-        for route_id, stops in self.route_stops.items():
-            for stop_info in stops.values():
-                if stop_info["stop_id"] == stop_id:
-                    return stop_info["coordinates"]
-        return None
 
     def get_near_stop_ids(self, coords, margin):
         """
@@ -899,6 +858,35 @@ class GTFSData:
         seq = self.route_stops[route_id][stop_id]["sequence"]
         return seq
 
+    def haversine(self, lon1, lat1, lon2, lat2):
+        """
+        Calcula la distancia entre dos puntos usando la fórmula de Haversine.
+        
+        Parameters:
+        lon1, lat1: Coordenadas del primer punto (longitud, latitud) en grados
+        lon2, lat2: Coordenadas del segundo punto (longitud, latitud) en grados
+        
+        Returns:
+        float: Distancia en kilómetros
+        """
+        from math import radians, sin, cos, sqrt, atan2
+        
+        # Radio de la Tierra en kilómetros
+        R = 6371.0
+        
+        # Convertir grados a radianes
+        lat1_rad = radians(lat1)
+        lat2_rad = radians(lat2)
+        delta_lat = radians(lat2 - lat1)
+        delta_lon = radians(lon2 - lon1)
+        
+        # Fórmula de Haversine
+        a = sin(delta_lat/2)**2 + cos(lat1_rad) * cos(lat2_rad) * sin(delta_lon/2)**2
+        c = 2 * atan2(sqrt(a), sqrt(1-a))
+        
+        distance = R * c
+        return distance
+
     def walking_travel_time(self, stop_coords, location_coords, speed):
         """
         Calculates the walking travel time between a location and a stop, given a speed value.
@@ -951,6 +939,35 @@ class GTFSData:
         
         # Return at most max_stops
         return nearby_stops[:max_stops]
+
+    def get_stop_coords(self, stop_id: str):
+        """
+        Obtiene las coordenadas (lon, lat) de una parada.
+        
+        Args:
+            stop_id: ID de la parada
+            
+        Returns:
+            tuple: (lon, lat) o None si no existe la parada
+        """
+        # Buscar en todas las rutas
+        for route_id, stops_dict in self.route_stops.items():
+            if stop_id in stops_dict:
+                coords = stops_dict[stop_id].get('coordinates')
+                if coords:
+                    return coords  # Ya está en formato (lon, lat)
+        
+        # Si no se encuentra en route_stops, buscar en el scheduler
+        try:
+            stop = self.scheduler.stops_by_id(stop_id)
+            if stop and len(stop) > 0:
+                stop_obj = stop[0]
+                if stop_obj.stop_lon is not None and stop_obj.stop_lat is not None:
+                    return (stop_obj.stop_lon, stop_obj.stop_lat)
+        except:
+            pass
+        
+        return None
 
     def find_nearby_routes(self, stop_id: str, margin_km: float = 0.5):
         """
@@ -1058,11 +1075,6 @@ class GTFSData:
                         transfer_manager.add_transfer(transfer)
                         transfer_count += 1
         
-        print(f"✅ {transfer_count} transferencias calculadas")
-        stats = transfer_manager.get_statistics()
-        print(f"   - {stats['viable_transfers']} viables ({stats['viability_rate']*100:.1f}%)")
-        print(f"   - {stats['routes_with_transfers']} rutas con transferencias")
-        
         # Almacenar en la instancia
         self.transfer_manager = transfer_manager
         
@@ -1081,7 +1093,6 @@ class GTFSData:
             list: Lista de TransferConnection disponibles
         """
         if not hasattr(self, 'transfer_manager'):
-            print("⚠️  Transferencias no calculadas. Ejecute compute_all_transfers() primero.")
             return []
         
         if viable_only:

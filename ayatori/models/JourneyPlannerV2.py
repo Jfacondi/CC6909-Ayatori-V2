@@ -194,12 +194,6 @@ class JourneyPlannerV2:
         Returns:
             Journey con el viaje planificado, o None si no se encuentra ruta
         """
-        print(f"\n🗺️  Planificando viaje (v2.0)...")
-        print(f"   Origen: {origin_coords}")
-        print(f"   Destino: {destination_coords}")
-        print(f"   Salida: {departure_time}")
-        print(f"   Método: {'CSA (óptimo)' if use_csa else 'Simplificado'}")
-        
         if use_csa:
             # Usar Connection Scan Algorithm con soporte para múltiples transferencias
             try:
@@ -226,14 +220,11 @@ class JourneyPlannerV2:
                     # Convertir el primer Journey de CSA a nuestro formato
                     return self._convert_csa_journey_to_legacy(csa_journeys[0])
                 else:
-                    print("⚠️  CSA no encontró rutas, usando método simplificado...")
                     return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
                     
             except Exception as e:
-                print(f"⚠️  Error con CSA: {e}")
                 import traceback
                 traceback.print_exc()
-                print("   Usando método simplificado...")
                 return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
         else:
             return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
@@ -306,24 +297,16 @@ class JourneyPlannerV2:
         Encuentra rutas directas sin transferencias complejas.
         """
         # Paso 1: Encontrar paradas cercanas al origen
-        print(f"\n📍 Buscando paradas cerca del origen...")
         origin_stops = self.find_nearby_origin_stops(origin_coords)
         
         if not origin_stops:
-            print(f"❌ No se encontraron paradas cerca del origen")
             return None
         
-        print(f"   ✅ {len(origin_stops)} paradas encontradas")
-        
         # Paso 2: Encontrar paradas cercanas al destino
-        print(f"\n📍 Buscando paradas cerca del destino...")
         destination_stops = self.find_nearby_destination_stops(destination_coords)
         
         if not destination_stops:
-            print(f"❌ No se encontraron paradas cerca del destino")
             return None
-        
-        print(f"   ✅ {len(destination_stops)} paradas encontradas")
         
         # Paso 3: Crear objeto Journey
         journey = Journey(origin_coords, destination_coords)
@@ -347,7 +330,6 @@ class JourneyPlannerV2:
         routes_at_origin = self._find_routes_at_stop(best_origin_stop)
         
         if not routes_at_origin:
-            print(f"⚠️  No se encontraron rutas en parada {best_origin_stop}")
             return None
         
         # Paso 5: Para cada ruta, verificar si llega cerca del destino
@@ -371,7 +353,6 @@ class JourneyPlannerV2:
                             best_destination_stop = stop_id
         
         if not best_route:
-            print(f"⚠️  No se encontró ruta directa desde {best_origin_stop}")
             return None
         
         # Paso 6: Calcular tiempo de tránsito real usando horarios GTFS
@@ -472,7 +453,7 @@ class JourneyPlannerV2:
                     return timedelta(minutes=3 * stops_diff)
             
         except Exception as e:
-            print(f"   ⚠️  Error estimando tiempo: {e}")
+            pass
         
         # Fallback final: 30 minutos
         return timedelta(minutes=30)
