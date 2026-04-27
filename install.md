@@ -1,51 +1,50 @@
-# ayatori guide installation
+# Ayatori Installation Guide
 
 ## Prerequisites
 
-- [Conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/download.html)
-- Optional [Mamba](https://mamba.readthedocs.io/en/latest/)
+- [Conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/download.html) (Miniconda or Anaconda)
+- Optional: [Mamba](https://mamba.readthedocs.io/en/latest/) for faster installation
 
-## Create environment
+## Installation (Windows/Linux/MacOS)
+
+The recommended way to install dependencies is using Conda, especially for geospatial libraries like `geopandas` and `pyrosm` which can be difficult to install via pip on Windows.
+
+### 1. Create Conda Environment
 
 ```bash
 conda env create -f environment.yml
-activate ayatori-gtfs-processor
+conda activate ayatori-gtfs-processor
 ```
 
-or 
+Or using mamba:
 
 ```bash
 mamba env create -f environment.yml
-activate ayatori-gtfs-processor
+mamba activate ayatori-gtfs-processor
 ```
 
-The packages necessary to run the project are now installed inside the conda environment.
+### 2. Install Project in Editable Mode
 
-**Note: The following sections assume you are located in your conda environment.**
-
-## Set up project's module
-
-To move beyond notebook prototyping, all reusable code should go into the `ayatori/` folder package. To use that package inside your project, install the project's module in editable mode, so you can edit files in the `ayatori` folder and use the modules inside your notebooks :
+To use the `ayatori` package in your notebooks and scripts:
 
 ```bash
-pip install --editable .
+pip install -e .
 ```
 
-To use the module inside your notebooks, add `%autoreload` at the top of your notebook :
+## Windows Specific Notes
+
+If you encounter issues installing `pyrosm` or `geopandas` on Windows:
+1. Ensure you are using the `environment.yml` file as it pulls binaries from `conda-forge`.
+2. If you must use pip, download the wheel files for `GDAL`, `Fiona`, and `Rtree` from [Christoph Gohlke's libs](https://www.lfd.uci.edu/~gohlke/pythonlibs/) before installing other requirements.
+
+## Development Setup
+
+To use the module inside your notebooks with auto-reloading:
 
 ```python
 %load_ext autoreload
 %autoreload 2
 ```
-
-Example of module usage :
-
-```python
-from ayatori.utils.paths import data_dir
-data_dir()
-```
-
-## Set up Git diff for notebooks and lab
 
 We use [nbdime](https://nbdime.readthedocs.io/en/stable/index.html) for diffing and merging Jupyter notebooks.
 

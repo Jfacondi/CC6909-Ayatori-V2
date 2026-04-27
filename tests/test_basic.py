@@ -10,10 +10,22 @@ Ejecutar con:
 
 import sys
 import os
+import pytest
 from pathlib import Path
 
 # Agregar raíz al path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+try:
+    import pyrosm  # noqa: F401
+    _PYROSM_AVAILABLE = True
+except ImportError:
+    _PYROSM_AVAILABLE = False
+
+pyrosm_required = pytest.mark.skipif(
+    not _PYROSM_AVAILABLE,
+    reason="pyrosm not installed (requires conda on Windows)"
+)
 
 
 class TestImports:
@@ -33,6 +45,7 @@ class TestImports:
         from ayatori.models import GTFSData
         assert GTFSData is not None
 
+    @pyrosm_required
     def test_import_osm(self):
         """Probar importación de OSMGraph."""
         from ayatori.models import OSMGraph
@@ -85,11 +98,13 @@ class TestGTFSData:
 class TestOSMGraph:
     """Pruebas para el módulo OSMGraph."""
 
+    @pyrosm_required
     def test_osm_initialization(self):
         """Probar que se puede importar OSMGraph."""
         from ayatori.models import OSMGraph
         assert OSMGraph is not None
 
+    @pyrosm_required
     def test_osm_methods(self):
         """Verificar que los métodos principales existen."""
         from ayatori.models import OSMGraph
@@ -111,33 +126,33 @@ class TestOSMGraph:
             assert method in members, f"OSMGraph falta método: {method}"
 
 
-class TestNetworkxUsage:
-    """Probar que networkx se usa correctamente."""
+class TestRustworkxUsage:
+    """Probar que rustworkx se usa correctamente."""
 
-    def test_networkx_digraph(self):
-        """Verificar que se puede crear un DiGraph con networkx."""
-        import networkx as nx
-        
-        g = nx.DiGraph()
-        g.add_node("A", stop_id="stop_1")
-        g.add_node("B", stop_id="stop_2")
-        g.add_edge("A", "B", weight=1)
-        
-        assert len(g.nodes()) == 2
-        assert len(g.edges()) == 1
-        assert g.nodes["A"]["stop_id"] == "stop_1"
+    def test_rustworkx_digraph(self):
+        """Verificar que se puede crear un PyDiGraph con rustworkx."""
+        import rustworkx as rx
 
-    def test_networkx_graph(self):
-        """Verificar que se puede crear un Graph con networkx."""
-        import networkx as nx
-        
-        g = nx.Graph()
-        g.add_node(1, lon=-70.5, lat=-33.4)
-        g.add_node(2, lon=-70.6, lat=-33.5)
-        g.add_edge(1, 2, weight=10.5)
-        
-        assert len(g.nodes()) == 2
-        assert g.nodes[1]["lat"] == -33.4
+        g = rx.PyDiGraph()
+        idx_a = g.add_node({"stop_id": "stop_1"})
+        idx_b = g.add_node({"stop_id": "stop_2"})
+        g.add_edge(idx_a, idx_b, {"weight": 1})
+
+        assert len(g.node_indices()) == 2
+        assert len(g.edge_list()) == 1
+        assert g[idx_a]["stop_id"] == "stop_1"
+
+    def test_rustworkx_graph(self):
+        """Verificar que se puede crear un PyGraph con rustworkx."""
+        import rustworkx as rx
+
+        g = rx.PyGraph()
+        idx_1 = g.add_node({"lon": -70.5, "lat": -33.4})
+        idx_2 = g.add_node({"lon": -70.6, "lat": -33.5})
+        g.add_edge(idx_1, idx_2, {"weight": 10.5})
+
+        assert len(g.node_indices()) == 2
+        assert g[idx_1]["lat"] == -33.4
 
 
 class TestDataDirectory:
@@ -173,7 +188,7 @@ def run_basic_tests():
     }
     
     # Importar todos los tests
-    test_classes = [TestImports, TestGTFSData, TestOSMGraph, TestNetworkxUsage, TestDataDirectory]
+    test_classes = [TestImports, TestGTFSData, TestOSMGraph, TestRustworkxUsage, TestDataDirectory]
     
     for test_class in test_classes:
         print(f"\n{test_class.__name__}")

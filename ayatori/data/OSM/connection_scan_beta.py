@@ -4,7 +4,6 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import pygtfs
 import os
-import networkx as nx
 from pyrosm import get_data, OSM
 import numpy as np
 import matplotlib as mpl

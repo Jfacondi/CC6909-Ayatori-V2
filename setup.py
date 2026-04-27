@@ -27,5 +27,18 @@ setup(
     license='MIT',
     url='',
     packages=find_packages(),
+    install_requires=[
+        'numpy',
+        'pandas',
+        'networkx',
+        'geopy',
+        'pygtfs',
+        'python-dotenv',
+    ],
+    extras_require={
+        'dev': ['black', 'pylint', 'invoke', 'jupyterlab'],
+        'viz': ['matplotlib', 'seaborn', 'folium', 'plotly'],
+        'geo': ['geopandas', 'pyrosm'],
+    },
     long_description=readme(),
 )

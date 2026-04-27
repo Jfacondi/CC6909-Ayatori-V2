@@ -48,10 +48,10 @@ class JourneyLeg:
             return f"Walk({self.distance:.2f}km, {mins:.1f}min)"
         elif self.leg_type == 'transit':
             mins = self.duration.total_seconds() / 60
-            return f"Transit(Route {self.route_id}, {self.from_stop}→{self.to_stop}, {mins:.1f}min)"
+            return f"Transit(Route {self.route_id}, {self.from_stop}->{self.to_stop}, {mins:.1f}min)"
         elif self.leg_type == 'transfer':
             mins = self.duration.total_seconds() / 60
-            return f"Transfer({self.transfer_from}→{self.transfer_to}, {mins:.1f}min)"
+            return f"Transfer({self.transfer_from}->{self.transfer_to}, {mins:.1f}min)"
         return f"Leg({self.leg_type})"
 
 
@@ -108,7 +108,7 @@ class Journey:
         dep = self.get_departure_time().strftime('%H:%M')
         arr = self.get_arrival_time().strftime('%H:%M')
         
-        return (f"Journey({dep}→{arr}, {duration_mins:.0f}min, "
+        return (f"Journey({dep}->{arr}, {duration_mins:.0f}min, "
                 f"{self.number_of_transfers} transfers, {self.total_walking_distance:.2f}km walk)")
 
 
@@ -152,28 +152,18 @@ class JourneyPlannerV2:
         
         result = []
         for stop_id, distance in nearby:
-            walk_time = self.gtfs.walking_travel_time(
-                self.gtfs.stop_coords.get(stop_id, (0, 0)),
-                origin_coords,
-                self.walking_speed
-            )
+            raw_coords = self.gtfs.get_stop_coords(stop_id)  # devuelve (lon, lat) o None
+            if raw_coords is not None:
+                lon, lat = raw_coords
+                stop_latlon = (lat, lon)
+                walk_time = self.gtfs.walking_travel_time(
+                    stop_latlon, origin_coords, self.walking_speed
+                )
+            else:
+                walk_time = (distance / self.walking_speed) * 3600
             result.append((stop_id, distance, walk_time))
-        
+
         return result
-    
-    def find_nearby_destination_stops(self, destination_coords: Tuple[float, float],
-                                     max_stops: int = 5) -> List[Tuple[str, float, float]]:
-        """
-        Encuentra paradas cercanas al destino.
-        
-        Args:
-            destination_coords: Coordenadas de destino (lat, lon)
-            max_stops: Número máximo de paradas a retornar
-            
-        Returns:
-            Lista de tuplas (stop_id, distance_km, walking_time_seconds)
-        """
-        return self.find_nearby_origin_stops(destination_coords, max_stops)
     
     def plan_journey(self, 
                      origin_coords: Tuple[float, float],
@@ -195,37 +185,56 @@ class JourneyPlannerV2:
             Journey con el viaje planificado, o None si no se encuentra ruta
         """
         if use_csa:
-            # Usar Connection Scan Algorithm con soporte para múltiples transferencias
+            from .ConnectionScanAlgorithm import create_csa_planner
+
+            csa = create_csa_planner(
+                self.gtfs,
+                transfer_manager=getattr(self.gtfs, "transfer_manager", None),
+                max_walking_km=self.max_walking_distance,
+                walking_speed_kmh=self.walking_speed,
+                max_transfers=max_transfers,
+            )
+
             try:
-                from .ConnectionScanAlgorithm import create_csa_planner
-                
-                # Crear planificador CSA
-                csa = create_csa_planner(
-                    self.gtfs,
-                    transfer_manager=getattr(self.gtfs, 'transfer_manager', None),
-                    max_walking_km=self.max_walking_distance,
-                    walking_speed_kmh=self.walking_speed,
-                    max_transfers=max_transfers
-                )
-                
-                # Buscar rutas
                 csa_journeys = csa.find_journey(
                     origin_coords,
                     destination_coords,
                     departure_time,
-                    num_alternatives=3
+                    num_alternatives=3,
                 )
-                
-                if csa_journeys:
-                    # Convertir el primer Journey de CSA a nuestro formato
-                    return self._convert_csa_journey_to_legacy(csa_journeys[0])
-                else:
-                    return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
-                    
+            except ValueError:
+                raise
             except Exception as e:
                 import traceback
+                print(f"[JourneyPlannerV2] CSA falló: {e}")
                 traceback.print_exc()
-                return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
+                csa_journeys = []
+
+            if csa_journeys:
+                return self._convert_csa_journey_to_legacy(csa_journeys[0])
+
+            # Reintento con radio de caminata ampliado (hasta 2×)
+            wider_csa = create_csa_planner(
+                self.gtfs,
+                transfer_manager=getattr(self.gtfs, "transfer_manager", None),
+                max_walking_km=self.max_walking_distance * 2,
+                walking_speed_kmh=self.walking_speed,
+                max_transfers=max_transfers,
+            )
+            try:
+                csa_journeys = wider_csa.find_journey(
+                    origin_coords,
+                    destination_coords,
+                    departure_time,
+                    num_alternatives=3,
+                )
+            except Exception:
+                csa_journeys = []
+
+            if csa_journeys:
+                return self._convert_csa_journey_to_legacy(csa_journeys[0])
+
+            return None
         else:
             return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
     
@@ -238,16 +247,19 @@ class JourneyPlannerV2:
         if not isinstance(csa_journey, CSAJourney):
             return None
         
-        # Extraer coordenadas
-        origin_coords = self.gtfs.stop_coords.get(
-            csa_journey.segments[0].get('to', ''),
-            (0, 0)
-        )
-        dest_coords = self.gtfs.stop_coords.get(
-            csa_journey.segments[-1].get('from', ''),
-            (0, 0)
-        )
-        
+        # Extraer coordenadas de las paradas extremas del viaje CSA
+        def _stop_latlon(stop_id: str):
+            raw = self.gtfs.get_stop_coords(stop_id)  # (lon, lat) o None
+            if raw:
+                lon, lat = raw
+                return (lat, lon)
+            return (0.0, 0.0)
+
+        first_stop = csa_journey.segments[0].get("to", "")
+        last_stop = csa_journey.segments[-1].get("from", "")
+        origin_coords = _stop_latlon(first_stop)
+        dest_coords = _stop_latlon(last_stop)
+
         journey = Journey(origin_coords, dest_coords)
         
         # Convertir cada segmento
@@ -303,7 +315,7 @@ class JourneyPlannerV2:
             return None
         
         # Paso 2: Encontrar paradas cercanas al destino
-        destination_stops = self.find_nearby_destination_stops(destination_coords)
+        destination_stops = self.find_nearby_origin_stops(destination_coords)
         
         if not destination_stops:
             return None
@@ -412,11 +424,10 @@ class JourneyPlannerV2:
         try:
             # Intentar obtener tiempos reales de GTFS
             if hasattr(self.gtfs, 'get_arrival_times'):
-                departure_date = departure_time.date()
-                
-                # Obtener horarios de llegada a la parada de origen
+                departure_date_str = departure_time.strftime("%d/%m/%Y")
+
                 arrival_info = self.gtfs.get_arrival_times(
-                    route_id, from_stop, departure_date
+                    route_id, from_stop, departure_date_str
                 )
                 
                 if arrival_info and len(arrival_info) > 1:
@@ -453,26 +464,14 @@ class JourneyPlannerV2:
                     return timedelta(minutes=3 * stops_diff)
             
         except Exception as e:
-            pass
-        
+            print(f"[JourneyPlannerV2] _estimate_transit_time falló ({type(e).__name__}: {e})")
+
         # Fallback final: 30 minutos
         return timedelta(minutes=30)
     
     def _find_routes_at_stop(self, stop_id: str) -> List[str]:
-        """
-        Encuentra todas las rutas que pasan por una parada.
-        
-        Args:
-            stop_id: ID de la parada
-            
-        Returns:
-            Lista de route_ids que pasan por la parada
-        """
-        routes = []
-        for route_id, stops_dict in self.gtfs.route_stops.items():
-            if stop_id in stops_dict:
-                routes.append(route_id)
-        return routes
+        """Encuentra todas las rutas que pasan por una parada (O(1) con índice)."""
+        return list(self.gtfs._stop_to_routes.get(stop_id, []))
 
 
 # Función de conveniencia

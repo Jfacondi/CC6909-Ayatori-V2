@@ -122,26 +122,33 @@ def test_empty_gtfs():
     print("\n" + "-" * 70)
     print("TEST: Crear Grafo GTFS Vacío (Ejemplo)")
     print("-" * 70 + "\n")
-    
-    import networkx as nx
-    
+
+    import rustworkx as rx
+
     # Simular lo que hace GTFSData
-    g = nx.DiGraph()
-    
-    # Agregar algunos nodos de ejemplo
+    g = rx.PyDiGraph()
+    node_map = {}
+    idx_to_node = {}
+
     stops = ["stop_001", "stop_002", "stop_003"]
     for stop in stops:
-        g.add_node(stop, stop_id=stop)
-    
-    # Agregar algunas aristas
-    g.add_edge("stop_001", "stop_002", weight=1, u="stop_001", v="stop_002")
-    g.add_edge("stop_002", "stop_003", weight=1, u="stop_002", v="stop_003")
-    
+        idx = g.add_node({"stop_id": stop})
+        node_map[stop] = idx
+        idx_to_node[idx] = stop
+
+    g.add_edge(node_map["stop_001"], node_map["stop_002"],
+               {"weight": 1, "u": "stop_001", "v": "stop_002"})
+    g.add_edge(node_map["stop_002"], node_map["stop_003"],
+               {"weight": 1, "u": "stop_002", "v": "stop_003"})
+
+    node_ids = [idx_to_node[i] for i in g.node_indices()]
+    edges = [(idx_to_node[u], idx_to_node[v]) for u, v in g.edge_list()]
+
     print(f"✓ Grafo creado exitosamente")
-    print(f"  - Nodos: {len(g.nodes())}")
-    print(f"  - Aristas: {len(g.edges())}")
-    print(f"  - Nodos: {list(g.nodes())}")
-    print(f"  - Aristas: {list(g.edges())}")
+    print(f"  - Nodos: {len(g.node_indices())}")
+    print(f"  - Aristas: {len(g.edge_list())}")
+    print(f"  - Nodos: {node_ids}")
+    print(f"  - Aristas: {edges}")
 
 
 def test_empty_osm():
@@ -149,38 +156,40 @@ def test_empty_osm():
     print("\n" + "-" * 70)
     print("TEST: Crear Grafo OSM Vacío (Ejemplo)")
     print("-" * 70 + "\n")
-    
-    import networkx as nx
+
+    import rustworkx as rx
     import numpy as np
-    
+
     # Simular lo que hace OSMGraph
-    g = nx.Graph()
-    
-    # Agregar algunos nodos con coordenadas
-    nodes = [
+    g = rx.PyGraph()
+    node_id_to_idx = {}
+    idx_to_node_id = {}
+
+    raw_nodes = [
         (1, {"lon": -70.5, "lat": -33.4}),
         (2, {"lon": -70.51, "lat": -33.41}),
         (3, {"lon": -70.52, "lat": -33.42}),
     ]
-    
-    for node_id, attrs in nodes:
-        g.add_node(node_id, **attrs)
-    
-    # Agregar aristas
+
+    for node_id, attrs in raw_nodes:
+        idx = g.add_node({**attrs, "node_id": node_id})
+        node_id_to_idx[node_id] = idx
+        idx_to_node_id[idx] = node_id
+
     coords = np.array([[-70.5, -33.4], [-70.51, -33.41], [-70.52, -33.42]])
-    distance = np.linalg.norm(coords[0] - coords[1])
-    g.add_edge(1, 2, weight=distance, length=distance)
-    
-    distance = np.linalg.norm(coords[1] - coords[2])
-    g.add_edge(2, 3, weight=distance, length=distance)
-    
+    d01 = np.linalg.norm(coords[0] - coords[1])
+    g.add_edge(node_id_to_idx[1], node_id_to_idx[2], {"weight": d01, "length": d01})
+
+    d12 = np.linalg.norm(coords[1] - coords[2])
+    g.add_edge(node_id_to_idx[2], node_id_to_idx[3], {"weight": d12, "length": d12})
+
     print(f"✓ Grafo OSM creado exitosamente")
-    print(f"  - Nodos: {len(g.nodes())}")
-    print(f"  - Aristas: {len(g.edges())}")
+    print(f"  - Nodos: {len(g.node_indices())}")
+    print(f"  - Aristas: {len(g.edge_list())}")
     print(f"  - Nodos con coords:")
-    for node_id in g.nodes():
-        attrs = g.nodes[node_id]
-        print(f"    - Node {node_id}: lon={attrs['lon']}, lat={attrs['lat']}")
+    for idx in g.node_indices():
+        data = g[idx]
+        print(f"    - Node {data['node_id']}: lon={data['lon']}, lat={data['lat']}")
 
 
 def test_data_files():
@@ -231,6 +240,7 @@ def test_dependencies():
         "seaborn",
         "plotly",
         "folium",
+        "rustworkx",
         "networkx",
         "pygtfs",
         "pyrosm",

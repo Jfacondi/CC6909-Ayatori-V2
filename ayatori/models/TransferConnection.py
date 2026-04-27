@@ -7,7 +7,7 @@ Este módulo maneja las conexiones de transbordo entre diferentes rutas
 de transporte público.
 """
 
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from dataclasses import dataclass
 
 
@@ -72,8 +72,8 @@ class TransferConnection:
         return self.walking_time_seconds + waiting_time_seconds
     
     def __repr__(self):
-        return (f"Transfer(Route {self.from_route_id}→{self.to_route_id}, "
-                f"Stop {self.from_stop_id}→{self.to_stop_id}, "
+        return (f"Transfer(Route {self.from_route_id}->{self.to_route_id}, "
+                f"Stop {self.from_stop_id}->{self.to_stop_id}, "
                 f"{self.walking_distance_km*1000:.0f}m, "
                 f"{self.walking_time_seconds:.0f}s)")
     
@@ -96,41 +96,97 @@ class TransferConnection:
 class TransferManager:
     """
     Administrador de transferencias entre rutas.
-    
+
     Mantiene un registro de todas las transferencias posibles
     y proporciona métodos para consultar opciones de transbordo.
+    Soporta deduplicación automática y persistencia en JSON.
     """
-    
+
     def __init__(self):
         """Inicializa el administrador de transferencias"""
-        # Diccionario: {(from_route, from_stop): [TransferConnection, ...]}
+        # {(from_route, from_stop): [TransferConnection, ...]}
         self.transfers: Dict[tuple, list] = {}
-        
-        # Índice por ruta de destino para búsquedas rápidas
-        # {to_route_id: [(from_route, from_stop, transfer), ...]}
+
+        # {to_route_id: [(from_route, from_stop, TransferConnection), ...]}
         self.transfers_by_destination: Dict[str, list] = {}
-    
+
+        # Conjunto de claves únicas para deduplicación en O(1)
+        # (from_route, from_stop, to_route, to_stop)
+        self._seen: set = set()
+
     def add_transfer(self, transfer: TransferConnection):
         """
         Agrega una transferencia al registro.
-        
+        Ignora duplicados (misma ruta origen, parada origen, ruta destino, parada destino).
+
         Args:
             transfer: TransferConnection a agregar
         """
+        dedup_key = (
+            transfer.from_route_id,
+            transfer.from_stop_id,
+            transfer.to_route_id,
+            transfer.to_stop_id,
+        )
+        if dedup_key in self._seen:
+            return
+        self._seen.add(dedup_key)
+
         key = (transfer.from_route_id, transfer.from_stop_id)
-        
         if key not in self.transfers:
             self.transfers[key] = []
-        
         self.transfers[key].append(transfer)
-        
-        # Actualizar índice por destino
+
         if transfer.to_route_id not in self.transfers_by_destination:
             self.transfers_by_destination[transfer.to_route_id] = []
-        
         self.transfers_by_destination[transfer.to_route_id].append(
             (transfer.from_route_id, transfer.from_stop_id, transfer)
         )
+
+    def save(self, path: str):
+        """
+        Persiste todas las transferencias en un archivo JSON.
+
+        Args:
+            path: Ruta del archivo de salida
+        """
+        import json
+
+        records = []
+        for transfers_list in self.transfers.values():
+            for t in transfers_list:
+                records.append(t.to_dict())
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+
+    @classmethod
+    def load(cls, path: str) -> "TransferManager":
+        """
+        Carga transferencias desde un archivo JSON previamente guardado con save().
+
+        Args:
+            path: Ruta del archivo JSON
+
+        Returns:
+            TransferManager con todas las transferencias cargadas
+
+        Raises:
+            FileNotFoundError: si el archivo no existe
+            ValueError: si el JSON está malformado
+        """
+        import json
+
+        manager = cls()
+        with open(path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        for d in records:
+            d.pop("is_viable", None)  # campo calculado, no almacenado
+            transfer = TransferConnection(**d)
+            manager.add_transfer(transfer)
+
+        return manager
     
     def get_transfers_from(self, route_id: str, stop_id: str) -> list:
         """

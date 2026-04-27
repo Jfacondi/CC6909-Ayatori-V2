@@ -2,33 +2,35 @@
 # mamba env create --file environment.yml
 name: ayatori-gtfs-processor
 channels:
-  - anaconda
   - conda-forge
   - defaults
 dependencies:
-  - black
-  - invoke
-  - jupyter
-  - jupyterlab
-  - keras
-  - lightgbm
-  - matplotlib
-  - missingno
-  - nbdime
+  - python=3.9
+  - pip
   - numpy
   - pandas
-  - pandas-flavor
-  - pandas-profiling
-  - pip
-  - plotly
-  - pyjanitor
-  - pylint
-  - pyprojroot
-  - pyspark
-  - python=3.9
-  - python-dotenv
-  - scikit-learn
+  - rustworkx
+  - networkx
+  - scipy
+  - matplotlib
   - seaborn
-  - statsmodels
-  - tensorflow
-  
+  - folium
+  - plotly
+  - scikit-learn
+  - python-dotenv
+  - jupyter
+  - jupyterlab
+  - black
+  - pylint
+  - invoke
+  # Geospatial dependencies (easier with conda)
+  - geopandas
+  - rtree
+  - pyrosm
+  - pip:
+    - pygtfs
+    - geopy
+    - pandas-flavor
+    - pyjanitor
+    - pyprojroot
+    - nbdime

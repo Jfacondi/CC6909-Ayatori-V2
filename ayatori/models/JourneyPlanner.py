@@ -11,8 +11,7 @@ Este módulo implementa un planificador de viajes que:
 """
 
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, Dict
-import heapq
+from typing import List, Tuple, Optional
 
 
 class JourneyLeg:
@@ -49,9 +48,9 @@ class JourneyLeg:
         if self.leg_type == 'walk':
             return f"Walk({self.walking_distance:.2f}km, {self.duration/60:.1f}min)"
         elif self.leg_type == 'transit':
-            return f"Transit(Route {self.route_id}, {self.from_stop}→{self.to_stop}, {self.duration/60:.1f}min)"
+            return f"Transit(Route {self.route_id}, {self.from_stop}->{self.to_stop}, {self.duration/60:.1f}min)"
         elif self.leg_type == 'transfer':
-            return f"Transfer({self.transfer_from}→{self.transfer_to}, {self.duration/60:.1f}min)"
+            return f"Transfer({self.transfer_from}->{self.transfer_to}, {self.duration/60:.1f}min)"
         return f"Leg({self.leg_type})"
 
 

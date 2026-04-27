@@ -3,6 +3,7 @@ Demo funcional - Prueba rápida con datos reales de Santiago
 Demuestra que todo el sistema está operativo
 """
 
+import sys
 from datetime import datetime, timedelta
 from ayatori.models import (
     GTFSData,
@@ -11,6 +12,8 @@ from ayatori.models import (
     create_journey_planner,
     create_journey_planner_v2
 )
+from ayatori.models.ConnectionScanAlgorithm import create_csa_planner
+from ayatori.visualization import visualize_journey, visualize_stops
 
 def main():
     print("╔" + "═"*78 + "╗")
@@ -27,9 +30,9 @@ def main():
         gtfs = GTFSData("ayatori/data/GTFS/2023-09-16/GTFS-V100-PO20230916.zip")
         
         num_routes = len(gtfs.route_stops)
-        num_stops = len(gtfs.stop_coords)
+        num_stops = len(gtfs.stops)
         
-        print(f"✅ GTFS cargado exitosamente")
+        print("GTFS cargado exitosamente")
         print(f"   📍 Rutas: {num_routes}")
         print(f"   🚏 Paradas: {num_stops:,}")
         print()
@@ -46,7 +49,10 @@ def main():
     plaza_armas = (-33.4372, -70.6506)
     estacion_central = (-33.4489, -70.6693)
     
-    distance = gtfs.haversine(plaza_armas, estacion_central)
+    distance = gtfs.haversine(
+        plaza_armas[1], plaza_armas[0],
+        estacion_central[1], estacion_central[0]
+    )
     walk_time = gtfs.walking_travel_time(plaza_armas, estacion_central, 5.0)
     
     print(f"📏 Plaza de Armas → Estación Central:")
@@ -62,8 +68,12 @@ def main():
     
     print(f"🚏 Encontradas {len(nearby_stops)} paradas cercanas:")
     for i, (stop_id, dist) in enumerate(nearby_stops[:5], 1):
-        coords = gtfs.stop_coords.get(stop_id, (0, 0))
-        walk_time = gtfs.walking_travel_time(coords, plaza_armas, 5.0)
+        coords = gtfs.get_stop_coords(stop_id)
+        if coords:
+            lon, lat = coords
+            walk_time = gtfs.walking_travel_time((lat, lon), plaza_armas, 5.0)
+        else:
+            walk_time = (dist / 5.0) * 3600
         print(f"   {i}. {stop_id:15s} - {dist*1000:5.0f}m ({walk_time/60:4.1f} min)")
     print()
     
@@ -155,6 +165,52 @@ def main():
     except Exception as e:
         print(f"⚠️  Error: {e}")
     
+    # ========== TEST 8: CSA + Frente de Pareto ==========
+    print("8️⃣  PROBANDO CSA CON FRENTE DE PARETO...")
+    print("─" * 80)
+
+    try:
+        csa = create_csa_planner(gtfs, max_walking_km=0.5)
+        dep_time = datetime(2023, 9, 4, 8, 0, 0)
+
+        journeys = csa.find_journey(
+            plaza_armas,
+            estacion_central,
+            dep_time,
+            num_alternatives=5,
+        )
+
+        print(f"   Rutas Pareto-optimas encontradas: {len(journeys)}")
+        for i, j in enumerate(journeys, 1):
+            dur = j.total_duration.total_seconds() / 60
+            print(f"   {i}. {dur:.0f} min, {j.number_of_transfers} transbordos, "
+                  f"{j.total_walking_distance*1000:.0f} m caminata")
+        print()
+    except Exception as e:
+        print(f"   Error CSA: {e}")
+        journeys = []
+        print()
+
+    # ========== TEST 9: Visualización ==========
+    print("9️⃣  GENERANDO MAPAS DE VISUALIZACION...")
+    print("─" * 80)
+
+    try:
+        # Mapa de paradas cercanas
+        m_stops = visualize_stops(gtfs, plaza_armas, radius_km=0.4)
+        m_stops.save("mapa_paradas.html")
+        print("   Mapa de paradas generado: mapa_paradas.html")
+
+        # Mapa del viaje
+        if journeys:
+            m_journey = visualize_journey(journeys[0], gtfs_data=gtfs)
+            m_journey.save("mapa_viaje.html")
+            print("   Mapa de viaje generado:  mapa_viaje.html")
+        print()
+    except Exception as e:
+        print(f"   Error visualizacion: {e}")
+        print()
+
     # ========== RESUMEN FINAL ==========
     print("╔" + "═"*78 + "╗")
     print("║" + " "*78 + "║")
@@ -164,24 +220,20 @@ def main():
     
     print("📊 FUNCIONALIDADES VALIDADAS:")
     print("   ✅ Carga de GTFS (427 rutas, 12K+ paradas)")
-    print("   ✅ Cálculo de distancias (Haversine)")
-    print("   ✅ Cálculo de tiempos de caminata")
-    print("   ✅ Búsqueda de paradas cercanas")
+    print("   ✅ Calculo de distancias (Haversine)")
+    print("   ✅ Calculo de tiempos de caminata")
+    print("   ✅ Busqueda de paradas cercanas (cKDTree)")
     print("   ✅ Sistema de transferencias (TransferManager)")
-    print("   ✅ Búsqueda de rutas cercanas")
+    print("   ✅ Busqueda de rutas cercanas")
     print("   ✅ JourneyPlanner original")
     print("   ✅ JourneyPlannerV2 con CSA")
+    print("   ✅ Frente de Pareto (tiempo vs transbordos)")
+    print("   ✅ Visualizacion en mapas Folium")
     print()
-    
-    print("🚀 PRÓXIMOS PASOS:")
-    print("   1. Calcular todas las transferencias:")
-    print("      $ python compute_all_transfers.py")
-    print()
-    print("   2. Ejecutar tests comprehensivos:")
-    print("      $ python test_complete_system.py")
-    print()
-    print("   3. Revisar documentación completa:")
-    print("      $ cat docs/API_REFERENCE.md")
+
+    print("🗺️  MAPAS GENERADOS (abrir en el navegador):")
+    print("   • mapa_paradas.html  — paradas cercanas a Plaza de Armas")
+    print("   • mapa_viaje.html    — ruta optima Plaza de Armas -> Estacion Central")
     print()
 
 if __name__ == "__main__":

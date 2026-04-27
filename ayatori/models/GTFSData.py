@@ -1,9 +1,12 @@
 import pygtfs
 import os
 import pandas as pd
-from math import *
+import numpy as np
+from scipy.spatial import cKDTree
+from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, date, time, timedelta
-import networkx as nx
+import rustworkx as rx
+import folium
 from ..utils.gtfs_cleaner import clean_gtfs_stops
 
 
@@ -11,12 +14,55 @@ class GTFSData:
     def __init__(self, GTFS_PATH="gtfs.zip"):
         self.scheduler = self.create_scheduler(GTFS_PATH)
         self.graphs = {}
+        self._graph_node_maps = {}    # {route_id: {stop_id: rx_idx}}
+        self._graph_idx_to_node = {}  # {route_id: {rx_idx: stop_id}}
         self.route_stops = {}
         self.special_dates = []
         self.stops = set()
-        self.stop_coords = {}  # Inicializar diccionario de coordenadas
         self.graphs, self.route_stops, self.special_dates = self.get_gtfs_data()
         self.stops = self.get_stop_ids()
+        self._build_spatial_index()
+        self._build_route_index()
+
+    def _build_spatial_index(self):
+        """Construye un índice espacial para búsquedas rápidas de paradas"""
+        self._stop_ids_list = []
+        coords = []
+        for stop in self.scheduler.stops:
+            if stop.stop_lat is not None and stop.stop_lon is not None:
+                try:
+                    lat = float(stop.stop_lat)
+                    lon = float(stop.stop_lon)
+                    self._stop_ids_list.append(stop.stop_id)
+                    coords.append([lat, lon])
+                except (ValueError, TypeError):
+                    continue
+        
+        if coords:
+            self._stop_coords_array = np.array(coords)
+            self._spatial_tree = cKDTree(self._stop_coords_array)
+        else:
+            self._spatial_tree = None
+
+    def _build_route_index(self):
+        """
+        Construye índices para búsquedas rápidas:
+          - _stop_to_routes: {stop_id: [route_id, ...]}  → O(1) por parada
+          - _sorted_route_stops: {route_id: [(stop_id, stop_info), ...]} ordenado por secuencia
+        """
+        from collections import defaultdict
+
+        self._stop_to_routes: dict = defaultdict(list)
+        self._sorted_route_stops: dict = {}
+
+        for route_id, stops_dict in self.route_stops.items():
+            for stop_id in stops_dict:
+                self._stop_to_routes[stop_id].append(route_id)
+
+            self._sorted_route_stops[route_id] = sorted(
+                stops_dict.items(),
+                key=lambda kv: kv[1]["sequence"],
+            )
 
     def create_scheduler(self, GTFS_PATH):
         """
@@ -50,7 +96,7 @@ class GTFSData:
                     scheduler = pygtfs.Schedule(":memory:")
                     pygtfs.append_feed(scheduler, str(gtfs_to_use))
                     return scheduler
-                except Exception as clean_error:
+                except Exception:
                     raise
             else:
                 raise
@@ -76,7 +122,9 @@ class GTFSData:
         stop_coords = {}
 
         for route in sched.routes:
-            graph = nx.DiGraph()
+            graph = rx.PyDiGraph()
+            node_map = {}    # {stop_id: rx_idx}
+            idx_to_node = {}  # {rx_idx: stop_id}
             stop_ids = set()
             trips = [trip for trip in sched.trips if trip.route_id == route.route_id]
 
@@ -98,8 +146,10 @@ class GTFSData:
 
                     stop_ids.add(vertex)
                     # Add node to graph if it doesn't exist
-                    if vertex not in graph:
-                        graph.add_node(vertex, stop_id=stop_id)
+                    if vertex not in node_map:
+                        idx = graph.add_node({"stop_id": stop_id})
+                        node_map[vertex] = idx
+                        idx_to_node[idx] = vertex
 
                     if i < len(stop_times) - 1:
                         next_stop_id = stop_times[i + 1].stop_id
@@ -112,7 +162,15 @@ class GTFSData:
 
                         edge = (vertex, next_vertex)
                         if edge not in added_edges:  # Check if the edge has already been added
-                            graph.add_edge(vertex, next_vertex, weight=1, u=vertex, v=next_vertex)
+                            if next_vertex not in node_map:
+                                next_idx = graph.add_node({"stop_id": next_stop_id})
+                                node_map[next_vertex] = next_idx
+                                idx_to_node[next_idx] = next_vertex
+                            graph.add_edge(
+                                node_map[vertex],
+                                node_map[next_vertex],
+                                {"weight": 1, "u": vertex, "v": next_vertex},
+                            )
                             added_edges.add(edge)  # Add the edge to the set of added edges
 
                         if route.route_id not in stop_coords:
@@ -158,6 +216,8 @@ class GTFSData:
                         )
 
             self.graphs[route.route_id] = graph
+            self._graph_node_maps[route.route_id] = node_map
+            self._graph_idx_to_node[route.route_id] = idx_to_node
 
             stops_by_direction = {"round_trip": [], "return_trip": []}
             for trip in trips:
@@ -233,14 +293,18 @@ class GTFSData:
             return None
 
         graph = self.graphs[route_id]
+        idx_to_node = self._graph_idx_to_node[route_id]
+
         vertices = []
-        for v in graph.nodes():
-            node_id = v
+        for idx in graph.node_indices():
+            node_id = idx_to_node[idx]
             if node_id != "" and node_id is not None:
                 vertices.append(node_id)
 
         edges = []
-        for u, v in graph.edges():
+        for u_idx, v_idx in graph.edge_list():
+            u = idx_to_node[u_idx]
+            v = idx_to_node[v_idx]
             if u is not None and v is not None:
                 edges.append((u, v))
 
@@ -261,7 +325,8 @@ class GTFSData:
             return None
 
         graph = self.graphs[route_id]
-        vertices = [v for v in graph.nodes()]
+        idx_to_node = self._graph_idx_to_node[route_id]
+        vertices = [idx_to_node[idx] for idx in graph.node_indices()]
 
         return vertices
 
@@ -280,7 +345,8 @@ class GTFSData:
             return None
 
         graph = self.graphs[route_id]
-        edges = [(u, v) for u, v in graph.edges()]
+        idx_to_node = self._graph_idx_to_node[route_id]
+        edges = [(idx_to_node[u], idx_to_node[v]) for u, v in graph.edge_list()]
 
         return edges
 
@@ -391,25 +457,29 @@ class GTFSData:
         that are within the specified margin of the given coordinates, along with their orientations.
 
         Parameters:
-        coords (tuple): A tuple of two floats representing the longitude and latitude of the coordinates to search around.
-        margin (float): The maximum distance (in kilometers) from the given coordinates to include stops in the result.
+        coords (tuple): (lon, lat) of the search center.
+        margin (float): Maximum distance in kilometers.
 
         Returns:
-        tuple: A tuple of two lists. The first list contains the stop IDs that are within the specified margin of the given coordinates.
-        The second list contains tuples of stop IDs and their orientations.
+        tuple: ([stop_id, ...], [(stop_id, orientation), ...])
         """
+        lon, lat = coords
+        nearby = self.get_nearby_stops((lat, lon), margin_km=margin)
+
         stop_ids = []
         orientations = []
-        for route_id, stops in self.route_stops.items():
-            for stop_info in stops.values():
-                stop_coords = stop_info["coordinates"]
-                distance = self.haversine(coords[1], coords[0], stop_coords[1], stop_coords[0])
-                if distance <= margin:
-                    orientation = stop_info["orientation"]
-                    stop_id = stop_info["stop_id"]
-                    if stop_id not in stop_ids:
-                        stop_ids.append(stop_id)
-                        orientations.append((stop_id, orientation))
+        seen = set()
+        for stop_id, _ in nearby:
+            if stop_id in seen:
+                continue
+            seen.add(stop_id)
+            stop_ids.append(stop_id)
+            orientation = None
+            for stops_dict in self.route_stops.values():
+                if stop_id in stops_dict:
+                    orientation = stops_dict[stop_id]["orientation"]
+                    break
+            orientations.append((stop_id, orientation))
         return stop_ids, orientations
 
     def get_route_stop_ids(self, route_id):
@@ -422,8 +492,7 @@ class GTFSData:
         Returns:
         list: A list of stop IDs for the stops on the given route.
         """
-        stops = self.route_stops.get(route_id, {})
-        return stops.keys()
+        return list(self.route_stops.get(route_id, {}).keys())
 
     def route_stop_matcher(self, route_id, stop_id):
         """
@@ -512,7 +581,7 @@ class GTFSData:
                 connected_routes.append(route_id)
         return connected_routes
 
-    def get_routes_at_stop(self, stop_id):
+    def get_routes_at_stop(self, stop_id: str) -> list:
         """
         Finds all routes that have a stop at the given stop ID.
 
@@ -522,13 +591,7 @@ class GTFSData:
         Returns:
         list: A list of route IDs that have a stop at the given stop ID.
         """
-        routes = [
-            route_id
-            for route_id in self.route_stops.keys()
-            if stop_id in self.get_route_stop_ids(route_id)
-            and self.connection_finder(stop_id, stop_id)
-        ]
-        return routes
+        return list(self._stop_to_routes.get(stop_id, []))
 
     def is_24_hour_service(self, route_id):
         """
@@ -869,8 +932,6 @@ class GTFSData:
         Returns:
         float: Distancia en kilómetros
         """
-        from math import radians, sin, cos, sqrt, atan2
-        
         # Radio de la Tierra en kilómetros
         R = 6371.0
         
@@ -912,6 +973,7 @@ class GTFSData:
     def get_nearby_stops(self, location_coords, margin_km=0.5, max_stops=10):
         """
         Finds stops within a given distance margin from a location.
+        Optimized using cKDTree.
 
         Parameters:
         location_coords (tuple): A tuple with the location's coordinates (lat, lon).
@@ -921,18 +983,29 @@ class GTFSData:
         Returns:
         list: A list of tuples (stop_id, distance_km) sorted by distance, closest first.
         """
-        nearby_stops = []
+        if self._spatial_tree is None:
+            return []
+
         lat, lon = location_coords
         
-        # Iterate through all stops in the GTFS data
-        for stop in self.scheduler.stops:
-            if stop.stop_lat is not None and stop.stop_lon is not None:
-                # Calculate distance using haversine
-                distance = self.haversine(lon, lat, stop.stop_lon, stop.stop_lat)
-                
-                # If within margin, add to list
-                if distance <= margin_km:
-                    nearby_stops.append((stop.stop_id, distance))
+        # Aproximación: 1 grado latitud ~= 111 km
+        # Usamos un margen ligeramente mayor en grados para asegurar que incluimos todos los puntos
+        margin_deg = (margin_km / 111.0) * 1.2
+        
+        # Buscar índices de puntos candidatos en el árbol KD
+        # query_ball_point usa distancia Euclidiana, que es una buena aproximación local
+        indices = self._spatial_tree.query_ball_point([lat, lon], r=margin_deg)
+        
+        nearby_stops = []
+        for idx in indices:
+            stop_id = self._stop_ids_list[idx]
+            s_lat, s_lon = self._stop_coords_array[idx]
+            
+            # Calcular distancia exacta con Haversine
+            distance = self.haversine(lon, lat, s_lon, s_lat)
+            
+            if distance <= margin_km:
+                nearby_stops.append((stop_id, distance))
         
         # Sort by distance (closest first)
         nearby_stops.sort(key=lambda x: x[1])
@@ -964,7 +1037,7 @@ class GTFSData:
                 stop_obj = stop[0]
                 if stop_obj.stop_lon is not None and stop_obj.stop_lat is not None:
                     return (stop_obj.stop_lon, stop_obj.stop_lat)
-        except:
+        except Exception:
             pass
         
         return None
@@ -1079,6 +1152,53 @@ class GTFSData:
         self.transfer_manager = transfer_manager
         
         return transfer_manager
+
+    def get_or_compute_transfers(
+        self,
+        cache_path: str = None,
+        max_distance_km: float = 0.5,
+        walking_speed_kmh: float = 5.0,
+    ):
+        """
+        Retorna el TransferManager precalculado, cargándolo desde cache si existe.
+        Si no hay cache (o está corrupto), lo calcula y lo guarda.
+
+        Args:
+            cache_path: Ruta al archivo JSON de cache (None = no persistir)
+            max_distance_km: Distancia máxima de caminata para transbordos
+            walking_speed_kmh: Velocidad de caminata en km/h
+
+        Returns:
+            TransferManager con todas las transferencias viables
+        """
+        from .TransferConnection import TransferManager
+        import os
+
+        if hasattr(self, "transfer_manager"):
+            return self.transfer_manager
+
+        if cache_path and os.path.exists(cache_path):
+            try:
+                tm = TransferManager.load(cache_path)
+                self.transfer_manager = tm
+                print(f"Transferencias cargadas desde cache: {tm.count_transfers()} registros.")
+                return tm
+            except Exception as e:
+                print(f"Cache de transferencias inválido ({e}), recalculando...")
+
+        tm = self.compute_all_transfers(
+            max_distance_km=max_distance_km,
+            walking_speed_kmh=walking_speed_kmh,
+        )
+
+        if cache_path:
+            try:
+                tm.save(cache_path)
+                print(f"Cache de transferencias guardado en: {cache_path}")
+            except Exception as e:
+                print(f"No se pudo guardar cache de transferencias: {e}")
+
+        return tm
 
     def get_transfer_options(self, route_id: str, stop_id: str, viable_only: bool = True):
         """

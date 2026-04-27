@@ -6,8 +6,6 @@ import pandas as pd
 from pyrosm import OSM
 from pyrosm import get_data
 
-# network libraries
-import networkx as nx
 import matplotlib.pyplot as plt
 
 
