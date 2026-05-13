@@ -74,3 +74,10 @@ venv/
 # zone.identifier
 *Zone.Identifier
 .claude/settings.local.json
+
+# Generated map outputs
+mapa_*.html
+
+# IDE
+.vscode/
+.idea/

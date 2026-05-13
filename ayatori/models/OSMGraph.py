@@ -1,9 +1,11 @@
-import pyrosm
-import numpy as np
 import time as tm
+
+import numpy as np
+import pyrosm
 import rustworkx as rx
 from geopy.exc import GeocoderServiceError
 from geopy.geocoders import Nominatim
+from scipy.spatial import cKDTree
 
 
 class OSMGraph:
@@ -11,7 +13,94 @@ class OSMGraph:
         self.node_coords = {}
         self._node_id_to_idx = {}
         self._idx_to_node_id = {}
+        self._node_id_list: list = []
+        self._coord_array: np.ndarray = np.empty((0, 2))
+        self._kdtree: cKDTree = None
         self.graph = self.create_osm_graph(OSM_PATH)
+        self._build_spatial_index()
+
+    def _build_spatial_index(self):
+        """Construye un KDTree sobre las coordenadas de los nodos OSM para
+        búsquedas espaciales O(log n).
+        """
+        if not self.node_coords:
+            self._kdtree = None
+            return
+        self._node_id_list = list(self.node_coords.keys())
+        # node_coords almacena (lat, lon); el KDTree consulta en el mismo orden.
+        self._coord_array = np.asarray(
+            [self.node_coords[nid] for nid in self._node_id_list],
+            dtype=np.float64,
+        )
+        self._kdtree = cKDTree(self._coord_array)
+
+    @classmethod
+    def from_file(cls, pbf_path: str, network_type: str = "walking") -> "OSMGraph":
+        """
+        Carga la red OSM desde un archivo .pbf ya descargado, sin descargar nada.
+        Útil para reutilizar archivos como Santiago.osm.pbf.
+
+        Args:
+            pbf_path: Ruta al archivo .pbf
+            network_type: Tipo de red ("walking", "cycling", "driving", "all")
+
+        Returns:
+            Instancia de OSMGraph inicializada
+        """
+        instance = cls.__new__(cls)
+        instance.node_coords = {}
+        instance._node_id_to_idx = {}
+        instance._idx_to_node_id = {}
+        instance._node_id_list = []
+        instance._coord_array = np.empty((0, 2))
+        instance._kdtree = None
+
+        osm = pyrosm.OSM(pbf_path)
+        nodes, edges = osm.get_network(network_type=network_type, nodes=True)
+
+        graph = rx.PyGraph()
+        node_id_to_idx, node_coords = instance._populate_graph(graph, nodes, edges)
+        instance._node_id_to_idx = node_id_to_idx
+        instance._idx_to_node_id = {idx: nid for nid, idx in node_id_to_idx.items()}
+        instance.node_coords = node_coords
+        instance.graph = graph
+        instance._build_spatial_index()
+        return instance
+
+    @staticmethod
+    def _populate_graph(graph, nodes, edges):
+        """Llena un PyGraph rustworkx con nodos+aristas del DataFrame pyrosm."""
+        node_id_to_idx = {}
+        node_coords = {}
+
+        for index, row in nodes.iterrows():
+            lon = row["lon"]
+            lat = row["lat"]
+            node_id = row["id"]
+            node_coords[node_id] = (lat, lon)
+
+            idx = graph.add_node({
+                "lon": lon, "lat": lat, "graph_id": index, "node_id": node_id,
+            })
+            node_id_to_idx[node_id] = idx
+
+        for _, row in edges.iterrows():
+            source_node = row["u"]
+            target_node = row["v"]
+            length = row["length"]
+
+            if length < 2 or not source_node or not target_node:
+                continue
+            if source_node not in node_id_to_idx or target_node not in node_id_to_idx:
+                continue
+
+            graph.add_edge(
+                node_id_to_idx[source_node],
+                node_id_to_idx[target_node],
+                {"u": source_node, "v": target_node, "length": length, "weight": length},
+            )
+
+        return node_id_to_idx, node_coords
 
     def download_osm_file(self, OSM_PATH):
         fp = pyrosm.get_data("Santiago", update=True, directory=OSM_PATH)
@@ -23,39 +112,10 @@ class OSMGraph:
         nodes, edges = osm.get_network(nodes=True)
 
         graph = rx.PyGraph()
-
-        for index, row in nodes.iterrows():
-            lon = row["lon"]
-            lat = row["lat"]
-            node_id = row["id"]
-            graph_id = index
-            self.node_coords[node_id] = (lat, lon)
-
-            idx = graph.add_node({
-                "lon": lon, "lat": lat, "graph_id": graph_id, "node_id": node_id
-            })
-            self._node_id_to_idx[node_id] = idx
-            self._idx_to_node_id[idx] = node_id
-
-        for index, row in edges.iterrows():
-            source_node = row["u"]
-            target_node = row["v"]
-
-            if row["length"] < 2 or source_node == "" or target_node == "":
-                continue
-            if source_node not in self._node_id_to_idx or target_node not in self._node_id_to_idx:
-                continue
-
-            source_coords = self.node_coords[source_node]
-            target_coords = self.node_coords[target_node]
-            distance = np.linalg.norm(np.array(source_coords) - np.array(target_coords))
-
-            graph.add_edge(
-                self._node_id_to_idx[source_node],
-                self._node_id_to_idx[target_node],
-                {"u": source_node, "v": target_node, "length": row["length"], "weight": distance},
-            )
-
+        node_id_to_idx, node_coords = self._populate_graph(graph, nodes, edges)
+        self._node_id_to_idx = node_id_to_idx
+        self._idx_to_node_id = {idx: nid for nid, idx in node_id_to_idx.items()}
+        self.node_coords = node_coords
         return graph
 
     def get_nodes_and_edges(self):
@@ -79,10 +139,9 @@ class OSMGraph:
             print(f"Edge: {source} -> {target}")
 
     def find_node_by_coordinates(self, lon, lat):
-        for idx in self.graph.node_indices():
-            data = self.graph[idx]
-            if data.get("lon") == lon and data.get("lat") == lat:
-                return self._idx_to_node_id[idx]
+        for nid, (n_lat, n_lon) in self.node_coords.items():
+            if n_lon == lon and n_lat == lat:
+                return nid
         return None
 
     def find_node_by_id(self, node_id):
@@ -91,34 +150,25 @@ class OSMGraph:
         return None
 
     def find_nearest_node(self, latitude, longitude):
-        query_point = np.array([longitude, latitude])
+        """Nodo OSM más cercano usando KDTree (O(log n))."""
+        if self._kdtree is None:
+            return None
+        _, idx = self._kdtree.query([latitude, longitude])
+        return self._node_id_list[idx]
 
-        node_ids = list(self._node_id_to_idx.keys())
-        coords = []
-        for nid in node_ids:
-            data = self.graph[self._node_id_to_idx[nid]]
-            coords.append([data.get("lon"), data.get("lat")])
+    def address_locator(self, address, max_retries: int = 15, retry_delay: float = 5.0):
+        """Geocodifica una dirección y devuelve el nodo OSM más cercano.
 
-        coords = np.array(coords)
-        distances = np.linalg.norm(coords - query_point, axis=1)
-        nearest_index = np.argmin(distances)
-        return node_ids[nearest_index]
-
-    def address_locator(self, address):
+        Reintenta hasta ``max_retries`` veces si el servicio Nominatim falla.
+        """
         geolocator = Nominatim(user_agent="ayatori")
-        while True:
+        location = None
+        for _ in range(max_retries):
             try:
                 location = geolocator.geocode(address)
                 break
             except GeocoderServiceError:
-                i = 0
-                if i < 15:
-                    tm.sleep(5)
-                    i += 1
-                else:
-                    return
-        if location is not None:
-            lat, lon = location.latitude, location.longitude
-            nearest = self.find_nearest_node(lat, lon)
-            return nearest
-        return None
+                tm.sleep(retry_delay)
+        if location is None:
+            return None
+        return self.find_nearest_node(location.latitude, location.longitude)

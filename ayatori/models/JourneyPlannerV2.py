@@ -3,9 +3,11 @@ JourneyPlanner Mejorado - Versión 2.0
 Incluye Connection Scan Algorithm y tiempos dinámicos
 """
 
+import traceback
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+from .ConnectionScanAlgorithm import Journey as CSAJourney, create_csa_planner
 
 
 class JourneyLeg:
@@ -185,8 +187,6 @@ class JourneyPlannerV2:
             Journey con el viaje planificado, o None si no se encuentra ruta
         """
         if use_csa:
-            from .ConnectionScanAlgorithm import create_csa_planner
-
             csa = create_csa_planner(
                 self.gtfs,
                 transfer_manager=getattr(self.gtfs, "transfer_manager", None),
@@ -205,7 +205,6 @@ class JourneyPlannerV2:
             except ValueError:
                 raise
             except Exception as e:
-                import traceback
                 print(f"[JourneyPlannerV2] CSA falló: {e}")
                 traceback.print_exc()
                 csa_journeys = []
@@ -238,12 +237,10 @@ class JourneyPlannerV2:
         else:
             return self._plan_journey_simple(origin_coords, destination_coords, departure_time)
     
-    def _convert_csa_journey_to_legacy(self, csa_journey) -> Journey:
+    def _convert_csa_journey_to_legacy(self, csa_journey) -> Optional[Journey]:
         """
         Convierte un Journey de CSA al formato de JourneyPlanner.
         """
-        from .ConnectionScanAlgorithm import Journey as CSAJourney
-        
         if not isinstance(csa_journey, CSAJourney):
             return None
         
@@ -436,7 +433,7 @@ class JourneyPlannerV2:
                     # Encontrar el próximo bus después de departure_time
                     departure_time_only = departure_time.time()
                     next_buses = self.gtfs.get_time_until_next_bus(
-                        arrival_times, departure_time_only, departure_date
+                        arrival_times, departure_time_only, departure_time.date()
                     )
                     
                     if next_buses:

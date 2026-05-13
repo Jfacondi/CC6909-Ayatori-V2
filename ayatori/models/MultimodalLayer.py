@@ -3,8 +3,12 @@ Capa multimodal unificada: conecta datos GTFS (tránsito) con OSM (calles).
 Proporciona una interfaz única para consultas de paradas y tiempos de caminata.
 """
 
-from typing import List, Tuple, Optional
-from math import radians, sin, cos, sqrt, atan2
+from math import asin, cos, radians, sin, sqrt
+from typing import List, Optional, Tuple
+
+import rustworkx as rx
+
+_EARTH_RADIUS_KM = 6371.0
 
 
 class MultimodalLayer:
@@ -209,8 +213,6 @@ class MultimodalLayer:
         no hay camino entre ellos.
         """
         try:
-            import rustworkx as rx
-
             src_node = self.snap_to_osm_node(from_coords)
             dst_node = self.snap_to_osm_node(to_coords)
 
@@ -246,12 +248,11 @@ class MultimodalLayer:
 
     @staticmethod
     def _haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-        R = 6371.0
         lat1_r, lat2_r = radians(lat1), radians(lat2)
-        d_lat = radians(lat2 - lat1)
-        d_lon = radians(lon2 - lon1)
-        a = sin(d_lat / 2) ** 2 + cos(lat1_r) * cos(lat2_r) * sin(d_lon / 2) ** 2
-        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+        half_d_lat = radians(lat2 - lat1) * 0.5
+        half_d_lon = radians(lon2 - lon1) * 0.5
+        a = sin(half_d_lat) ** 2 + cos(lat1_r) * cos(lat2_r) * sin(half_d_lon) ** 2
+        return _EARTH_RADIUS_KM * 2.0 * asin(sqrt(a))
 
     def __repr__(self):
         osm_status = "con OSM" if self.has_street_network else "sin OSM"

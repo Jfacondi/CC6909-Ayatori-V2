@@ -13,7 +13,7 @@ from ayatori.models import (
     create_journey_planner_v2
 )
 from ayatori.models.ConnectionScanAlgorithm import create_csa_planner
-from ayatori.visualization import visualize_journey, visualize_stops
+from ayatori.visualization import visualize_journey, visualize_journeys, visualize_stops
 
 def main():
     print("╔" + "═"*78 + "╗")
@@ -170,7 +170,7 @@ def main():
     print("─" * 80)
 
     try:
-        csa = create_csa_planner(gtfs, max_walking_km=0.5)
+        csa = create_csa_planner(gtfs, max_walking_km=0.8)
         dep_time = datetime(2023, 9, 4, 8, 0, 0)
 
         journeys = csa.find_journey(
@@ -183,13 +183,30 @@ def main():
         print(f"   Rutas Pareto-optimas encontradas: {len(journeys)}")
         for i, j in enumerate(journeys, 1):
             dur = j.total_duration.total_seconds() / 60
+            routes = [s["route_id"] for s in j.segments if s["type"] == "transit"]
             print(f"   {i}. {dur:.0f} min, {j.number_of_transfers} transbordos, "
-                  f"{j.total_walking_distance*1000:.0f} m caminata")
+                  f"{j.total_walking_distance*1000:.0f} m caminata  "
+                  f"[rutas: {', '.join(routes)}]")
         print()
     except Exception as e:
         print(f"   Error CSA: {e}")
         journeys = []
         print()
+
+    # ========== OSM (opcional, para caminata por calles reales) ==========
+    osm_graph = None
+    osm_pbf = "ayatori/data/OSM/Santiago.osm.pbf"
+    try:
+        import os
+        if os.path.exists(osm_pbf):
+            print("🗺️  Cargando red OSM para caminata por calles...")
+            from ayatori.models.OSMGraph import OSMGraph
+            osm_graph = OSMGraph.from_file(osm_pbf, network_type="walking")
+            print(f"   Red peatonal cargada: {len(osm_graph._node_id_to_idx):,} nodos\n")
+        else:
+            print("   (archivo OSM no encontrado, caminata en línea recta)\n")
+    except Exception as osm_err:
+        print(f"   (OSM no disponible: {osm_err})\n")
 
     # ========== TEST 9: Visualización ==========
     print("9️⃣  GENERANDO MAPAS DE VISUALIZACION...")
@@ -201,11 +218,13 @@ def main():
         m_stops.save("mapa_paradas.html")
         print("   Mapa de paradas generado: mapa_paradas.html")
 
-        # Mapa del viaje
+        # Mapa del viaje (todas las opciones en un solo mapa con capas)
         if journeys:
-            m_journey = visualize_journey(journeys[0], gtfs_data=gtfs)
+            m_journey = visualize_journeys(journeys, gtfs_data=gtfs, osm_graph=osm_graph)
             m_journey.save("mapa_viaje.html")
-            print("   Mapa de viaje generado:  mapa_viaje.html")
+            print(f"   Mapa de viaje generado:  mapa_viaje.html ({len(journeys)} opciones)")
+            if osm_graph:
+                print("   (caminatas trazadas por calles reales)")
         print()
     except Exception as e:
         print(f"   Error visualizacion: {e}")

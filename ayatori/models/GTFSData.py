@@ -1,13 +1,20 @@
-import pygtfs
+import logging
 import os
-import pandas as pd
-import numpy as np
-from scipy.spatial import cKDTree
-from math import radians, sin, cos, sqrt, atan2
+import warnings
+from collections import defaultdict
 from datetime import datetime, date, time, timedelta
-import rustworkx as rx
+from math import asin, cos, radians, sin, sqrt
+
 import folium
+import numpy as np
+import pandas as pd
+import pygtfs
+import rustworkx as rx
+from scipy.spatial import cKDTree
+
 from ..utils.gtfs_cleaner import clean_gtfs_stops
+
+_EARTH_RADIUS_KM = 6371.0
 
 
 class GTFSData:
@@ -49,15 +56,23 @@ class GTFSData:
         Construye índices para búsquedas rápidas:
           - _stop_to_routes: {stop_id: [route_id, ...]}  → O(1) por parada
           - _sorted_route_stops: {route_id: [(stop_id, stop_info), ...]} ordenado por secuencia
+          - _stop_coords: {stop_id: (lon, lat)}  → O(1) lookup de coordenadas
+          - arrival_times de cada parada se pre-ordenan una sola vez aquí
         """
-        from collections import defaultdict
-
         self._stop_to_routes: dict = defaultdict(list)
         self._sorted_route_stops: dict = {}
+        self._stop_coords: dict = {}
 
         for route_id, stops_dict in self.route_stops.items():
-            for stop_id in stops_dict:
+            for stop_id, stop_info in stops_dict.items():
                 self._stop_to_routes[stop_id].append(route_id)
+                if stop_id not in self._stop_coords:
+                    coords = stop_info.get("coordinates")
+                    if coords:
+                        self._stop_coords[stop_id] = coords
+                arrival_times = stop_info.get("arrival_times")
+                if arrival_times:
+                    arrival_times.sort()
 
             self._sorted_route_stops[route_id] = sorted(
                 stops_dict.items(),
@@ -74,9 +89,6 @@ class GTFSData:
         Returns:
         pygtfs.Schedule: the scheduler object
         """
-        import warnings
-        import logging
-        
         # Suprimir advertencias de pygtfs sobre paradas inválidas
         logging.getLogger('pygtfs').setLevel(logging.ERROR)
         warnings.filterwarnings('ignore')
@@ -573,13 +585,9 @@ class GTFSData:
         Returns:
         list: A list of route IDs that have stops at both given stop IDs.
         """
-        connected_routes = []
-        for route_id, stops in self.route_stops.items():
-            stop_ids = [stop_info["stop_id"] for stop_info in stops.values()]
-
-            if stop_id_1 in stop_ids and stop_id_2 in stop_ids:
-                connected_routes.append(route_id)
-        return connected_routes
+        routes_1 = self._stop_to_routes.get(stop_id_1, ())
+        routes_2 = set(self._stop_to_routes.get(stop_id_2, ()))
+        return [route_id for route_id in routes_1 if route_id in routes_2]
 
     def get_routes_at_stop(self, stop_id: str) -> list:
         """
@@ -921,32 +929,26 @@ class GTFSData:
         seq = self.route_stops[route_id][stop_id]["sequence"]
         return seq
 
-    def haversine(self, lon1, lat1, lon2, lat2):
+    @staticmethod
+    def haversine(lon1, lat1, lon2, lat2):
         """
         Calcula la distancia entre dos puntos usando la fórmula de Haversine.
-        
+
         Parameters:
         lon1, lat1: Coordenadas del primer punto (longitud, latitud) en grados
         lon2, lat2: Coordenadas del segundo punto (longitud, latitud) en grados
-        
+
         Returns:
         float: Distancia en kilómetros
         """
-        # Radio de la Tierra en kilómetros
-        R = 6371.0
-        
-        # Convertir grados a radianes
         lat1_rad = radians(lat1)
         lat2_rad = radians(lat2)
-        delta_lat = radians(lat2 - lat1)
-        delta_lon = radians(lon2 - lon1)
-        
-        # Fórmula de Haversine
-        a = sin(delta_lat/2)**2 + cos(lat1_rad) * cos(lat2_rad) * sin(delta_lon/2)**2
-        c = 2 * atan2(sqrt(a), sqrt(1-a))
-        
-        distance = R * c
-        return distance
+        half_delta_lat = radians(lat2 - lat1) * 0.5
+        half_delta_lon = radians(lon2 - lon1) * 0.5
+
+        a = (sin(half_delta_lat) ** 2
+             + cos(lat1_rad) * cos(lat2_rad) * sin(half_delta_lon) ** 2)
+        return _EARTH_RADIUS_KM * 2.0 * asin(sqrt(a))
 
     def walking_travel_time(self, stop_coords, location_coords, speed):
         """
@@ -1016,73 +1018,62 @@ class GTFSData:
     def get_stop_coords(self, stop_id: str):
         """
         Obtiene las coordenadas (lon, lat) de una parada.
-        
+
         Args:
             stop_id: ID de la parada
-            
+
         Returns:
             tuple: (lon, lat) o None si no existe la parada
         """
-        # Buscar en todas las rutas
-        for route_id, stops_dict in self.route_stops.items():
-            if stop_id in stops_dict:
-                coords = stops_dict[stop_id].get('coordinates')
-                if coords:
-                    return coords  # Ya está en formato (lon, lat)
-        
-        # Si no se encuentra en route_stops, buscar en el scheduler
+        coords = self._stop_coords.get(stop_id)
+        if coords is not None:
+            return coords
+
+        # Fallback: parada presente en el scheduler pero no en ninguna ruta
         try:
             stop = self.scheduler.stops_by_id(stop_id)
             if stop and len(stop) > 0:
                 stop_obj = stop[0]
                 if stop_obj.stop_lon is not None and stop_obj.stop_lat is not None:
-                    return (stop_obj.stop_lon, stop_obj.stop_lat)
+                    resolved = (stop_obj.stop_lon, stop_obj.stop_lat)
+                    self._stop_coords[stop_id] = resolved
+                    return resolved
         except Exception:
             pass
-        
+
         return None
 
     def find_nearby_routes(self, stop_id: str, margin_km: float = 0.5):
         """
         Encuentra otras rutas con paradas cercanas a una parada dada.
-        
+
         Args:
             stop_id: ID de la parada de referencia
             margin_km: Radio de búsqueda en kilómetros (default: 0.5 km)
-            
+
         Returns:
             dict: {route_id: [(nearby_stop_id, distance_km), ...]}
         """
-        # Obtener coordenadas de la parada de referencia
         stop_coords = self.get_stop_coords(stop_id)
         if stop_coords is None:
             return {}
-        
-        # Encontrar paradas cercanas
+
         nearby_stops = self.get_nearby_stops(
             (stop_coords[1], stop_coords[0]),  # get_nearby_stops espera (lat, lon)
             margin_km=margin_km,
-            max_stops=50  # Buscar más paradas para encontrar más rutas
+            max_stops=50,
         )
-        
-        # Agrupar por ruta
-        routes_nearby = {}
+
+        # Agrupar por ruta usando el índice stop→rutas (O(1) por parada vecina)
+        routes_nearby: dict = {}
         for nearby_stop_id, distance in nearby_stops:
-            # Saltar la misma parada
             if nearby_stop_id == stop_id:
                 continue
-            
-            # Encontrar rutas que pasan por esta parada cercana
-            for route_id, stops_dict in self.route_stops.items():
-                if nearby_stop_id in stops_dict:
-                    if route_id not in routes_nearby:
-                        routes_nearby[route_id] = []
-                    routes_nearby[route_id].append((nearby_stop_id, distance))
-        
-        # Ordenar paradas por distancia para cada ruta
-        for route_id in routes_nearby:
-            routes_nearby[route_id].sort(key=lambda x: x[1])
-        
+            for route_id in self._stop_to_routes.get(nearby_stop_id, ()):
+                routes_nearby.setdefault(route_id, []).append((nearby_stop_id, distance))
+
+        # Las paradas ya vienen ordenadas por distancia desde get_nearby_stops,
+        # así que las listas por ruta también heredan el orden correcto.
         return routes_nearby
 
     def compute_all_transfers(self, max_distance_km: float = 0.5, 

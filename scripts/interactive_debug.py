@@ -3,7 +3,7 @@
 Script interactivo para testear y debuggear el código de Ayatori.
 
 Uso:
-    python test_interactive.py
+    python scripts/interactive_debug.py
 
 Permite ejecutar tests específicos y ver el estado del código.
 """
@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 # Agregar raíz al path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import inspect
 

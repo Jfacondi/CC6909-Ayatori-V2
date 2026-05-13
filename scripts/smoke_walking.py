@@ -7,8 +7,8 @@ Quick test for walking time calculation and get_nearby_stops method
 import sys
 import os
 
-# Add the parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add the project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ayatori.models.GTFSData import GTFSData
 

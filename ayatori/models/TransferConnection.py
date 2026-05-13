@@ -7,8 +7,9 @@ Este módulo maneja las conexiones de transbordo entre diferentes rutas
 de transporte público.
 """
 
-from typing import Dict, Any
+import json
 from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
 
 @dataclass
@@ -150,12 +151,11 @@ class TransferManager:
         Args:
             path: Ruta del archivo de salida
         """
-        import json
-
-        records = []
-        for transfers_list in self.transfers.values():
-            for t in transfers_list:
-                records.append(t.to_dict())
+        records = [
+            t.to_dict()
+            for transfers_list in self.transfers.values()
+            for t in transfers_list
+        ]
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False)
@@ -175,8 +175,6 @@ class TransferManager:
             FileNotFoundError: si el archivo no existe
             ValueError: si el JSON está malformado
         """
-        import json
-
         manager = cls()
         with open(path, "r", encoding="utf-8") as f:
             records = json.load(f)
