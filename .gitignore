@@ -25,8 +25,6 @@ var/
 *.egg
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -44,6 +42,7 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+.pytest_cache/
 
 # Translations
 *.mo
@@ -61,8 +60,13 @@ target/
 # pyenv python configuration file
 .python-version
 
-# exclude data from source control by default
-/data/
+# Datos GTFS/OSM/encuestas — descargar con `ayatori-fetch-data`
+ayatori/data/GTFS/
+ayatori/data/OSM/*.pbf
+ayatori/data/OSM/*.exe
+ayatori/data/OSM/cache/
+ayatori/data/Origen-Destino(2012)/
+ayatori/data/cache/
 
 # ipynb checkpoints
 .ipynb_checkpoints

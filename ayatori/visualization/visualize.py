@@ -2,13 +2,11 @@
 Visualizacion de viajes y rutas sobre mapas Folium.
 """
 
-from typing import List, Optional
-
 import folium
 import rustworkx as rx
 
 
-def _get_walking_street_path(from_latlon, to_latlon, osm_graph) -> Optional[list]:
+def _get_walking_street_path(from_latlon, to_latlon, osm_graph) -> list | None:
     """
     Devuelve la lista de [lat, lon] siguiendo calles reales (OSM + dijkstra).
     Retorna None si no hay grafo OSM o si el ruteo falla.
@@ -48,21 +46,41 @@ def _get_walking_street_path(from_latlon, to_latlon, osm_graph) -> Optional[list
     except Exception:
         return None
 
+
 # Paleta de colores para rutas de transito
 _ROUTE_COLORS = [
-    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
-    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
-    "#dcbeff", "#9a6324", "#fffac8", "#800000", "#aaffc3",
-    "#808000", "#ffd8b1", "#000075", "#a9a9a9",
+    "#e6194b",
+    "#3cb44b",
+    "#4363d8",
+    "#f58231",
+    "#911eb4",
+    "#42d4f4",
+    "#f032e6",
+    "#bfef45",
+    "#fabed4",
+    "#469990",
+    "#dcbeff",
+    "#9a6324",
+    "#fffac8",
+    "#800000",
+    "#aaffc3",
+    "#808000",
+    "#ffd8b1",
+    "#000075",
+    "#a9a9a9",
 ]
 
 # Colores de caminata por opcion de viaje (para distinguirlas visualmente)
 _WALK_COLORS = [
-    "#555555", "#1a6bb5", "#b55a1a", "#1ab55a", "#b51a6b",
+    "#555555",
+    "#1a6bb5",
+    "#b55a1a",
+    "#1ab55a",
+    "#b51a6b",
 ]
 
 
-def _stop_latlon(stop_id: str, gtfs_data) -> Optional[list]:
+def _stop_latlon(stop_id: str, gtfs_data) -> list | None:
     if not gtfs_data or not stop_id:
         return None
     coords = gtfs_data.get_stop_coords(stop_id)
@@ -86,9 +104,11 @@ def _merge_transit_legs(raw_legs: list) -> list:
             route_id = leg.get("route_id")
             stop_ids: list = [leg.get("from_stop"), leg.get("to_stop")]
             j = i + 1
-            while (j < len(raw_legs) and
-                   raw_legs[j].get("type") == "transit" and
-                   raw_legs[j].get("route_id") == route_id):
+            while (
+                j < len(raw_legs)
+                and raw_legs[j].get("type") == "transit"
+                and raw_legs[j].get("route_id") == route_id
+            ):
                 stop_ids.append(raw_legs[j].get("to_stop"))
                 j += 1
             # Deduplicar manteniendo orden
@@ -98,13 +118,15 @@ def _merge_transit_legs(raw_legs: list) -> list:
                 if s and s not in seen:
                     seen.add(s)
                     unique_stops.append(s)
-            legs.append({
-                "type": "transit",
-                "route_id": route_id,
-                "stop_ids": unique_stops,
-                "departure_time": leg.get("departure_time"),
-                "arrival_time": raw_legs[j - 1].get("arrival_time"),
-            })
+            legs.append(
+                {
+                    "type": "transit",
+                    "route_id": route_id,
+                    "stop_ids": unique_stops,
+                    "departure_time": leg.get("departure_time"),
+                    "arrival_time": raw_legs[j - 1].get("arrival_time"),
+                }
+            )
             i = j
         else:
             legs.append(leg)
@@ -112,8 +134,9 @@ def _merge_transit_legs(raw_legs: list) -> list:
     return legs
 
 
-def _draw_journey_into(journey, container, gtfs_data, color_map: dict,
-                       walk_color: str = "#555555", osm_graph=None):
+def _draw_journey_into(
+    journey, container, gtfs_data, color_map: dict, walk_color: str = "#555555", osm_graph=None
+):
     """
     Dibuja los segmentos de un journey en un contenedor Folium (Map o FeatureGroup).
     Muta color_map agregando route_id → color asignado.
@@ -148,9 +171,8 @@ def _draw_journey_into(journey, container, gtfs_data, color_map: dict,
 
             if from_coords and to_coords:
                 walk_min = (dist_km / 5.0) * 60 if dist_km > 0 else 0
-                tooltip_walk = (
-                    f"🚶 Caminata  {dist_km * 1000:.0f} m"
-                    + (f" · ~{walk_min:.0f} min" if walk_min > 0 else "")
+                tooltip_walk = f"🚶 Caminata  {dist_km * 1000:.0f} m" + (
+                    f" · ~{walk_min:.0f} min" if walk_min > 0 else ""
                 )
 
                 # Intentar ruta por calles reales
@@ -194,11 +216,11 @@ def _draw_journey_into(journey, container, gtfs_data, color_map: dict,
                     icon=folium.DivIcon(
                         html=(
                             f'<div style="'
-                            f'font-size:16px;text-align:center;'
-                            f'background:rgba(255,255,255,0.92);'
-                            f'border:2px solid {walk_color};'
-                            f'border-radius:50%;width:28px;height:28px;'
-                            f'line-height:24px;box-shadow:0 1px 4px rgba(0,0,0,0.3);'
+                            f"font-size:16px;text-align:center;"
+                            f"background:rgba(255,255,255,0.92);"
+                            f"border:2px solid {walk_color};"
+                            f"border-radius:50%;width:28px;height:28px;"
+                            f"line-height:24px;box-shadow:0 1px 4px rgba(0,0,0,0.3);"
                             f'">🚶</div>'
                         ),
                         icon_size=(28, 28),
@@ -266,23 +288,33 @@ def _draw_journey_into(journey, container, gtfs_data, color_map: dict,
     # Calcular coords de origen y destino para los marcadores
     if is_csa:
         raw = journey.segments
-        first_walk = next((s for s in raw if s.get("type") == "walk" and s.get("from") == "origin"), None)
-        last_walk = next((s for s in reversed(raw) if s.get("type") == "walk" and s.get("to") == "destination"), None)
+        first_walk = next(
+            (s for s in raw if s.get("type") == "walk" and s.get("from") == "origin"), None
+        )
+        last_walk = next(
+            (s for s in reversed(raw) if s.get("type") == "walk" and s.get("to") == "destination"),
+            None,
+        )
         origin_coords = (first_walk.get("from_latlon") if first_walk else None) or (
             _sll(next((s.get("from_stop") for s in raw if s.get("type") == "transit"), None))
         )
         dest_coords = (last_walk.get("to_latlon") if last_walk else None) or (
-            _sll(next((s.get("to_stop") for s in reversed(raw) if s.get("type") == "transit"), None))
+            _sll(
+                next((s.get("to_stop") for s in reversed(raw) if s.get("type") == "transit"), None)
+            )
         )
     else:
         origin_coords = list(journey.origin_coords) if hasattr(journey, "origin_coords") else None
-        dest_coords = list(journey.destination_coords) if hasattr(journey, "destination_coords") else None
+        dest_coords = (
+            list(journey.destination_coords) if hasattr(journey, "destination_coords") else None
+        )
 
     return origin_coords, dest_coords
 
 
-def visualize_journey(journey, gtfs_data=None, output_path: str = None,
-                      osm_graph=None) -> folium.Map:
+def visualize_journey(
+    journey, gtfs_data=None, output_path: str = None, osm_graph=None
+) -> folium.Map:
     """
     Renderiza un viaje completo en un mapa Folium interactivo.
 
@@ -324,8 +356,9 @@ def visualize_journey(journey, gtfs_data=None, output_path: str = None,
     return m
 
 
-def visualize_journeys(journeys: list, gtfs_data=None,
-                       output_path: str = None, osm_graph=None) -> folium.Map:
+def visualize_journeys(
+    journeys: list, gtfs_data=None, output_path: str = None, osm_graph=None
+) -> folium.Map:
     """
     Renderiza multiples opciones de viaje en un mapa Folium con capas alternables.
 
@@ -372,8 +405,12 @@ def visualize_journeys(journeys: list, gtfs_data=None,
         walk_color = _WALK_COLORS[idx % len(_WALK_COLORS)]
 
         origin_coords, dest_coords = _draw_journey_into(
-            journey, fg, gtfs_data, color_map,
-            walk_color=walk_color, osm_graph=osm_graph,
+            journey,
+            fg,
+            gtfs_data,
+            color_map,
+            walk_color=walk_color,
+            osm_graph=osm_graph,
         )
 
         if origin_coords:
@@ -441,9 +478,13 @@ def _add_route_legend(m: folium.Map, color_map: dict):
     m.get_root().html.add_child(folium.Element(html))
 
 
-def visualize_routes(route_list: list, gtfs_data, stops: bool = True,
-                     orientation: str = "round",
-                     output_path: str = None) -> folium.Map:
+def visualize_routes(
+    route_list: list,
+    gtfs_data,
+    stops: bool = True,
+    orientation: str = "round",
+    output_path: str = None,
+) -> folium.Map:
     """
     Dibuja una o varias rutas GTFS en un mapa Folium.
 
@@ -464,7 +505,8 @@ def visualize_routes(route_list: list, gtfs_data, stops: bool = True,
         color = _ROUTE_COLORS[i % len(_ROUTE_COLORS)]
 
         trip_stops = [
-            info for info in route_stops.values()
+            info
+            for info in route_stops.values()
             if info.get("orientation") == orientation and info.get("coordinates")
         ]
         trip_stops.sort(key=lambda x: x["sequence"])
@@ -499,8 +541,9 @@ def visualize_routes(route_list: list, gtfs_data, stops: bool = True,
     return m
 
 
-def visualize_stops(gtfs_data, coords, radius_km: float = 0.5,
-                    output_path: str = None) -> folium.Map:
+def visualize_stops(
+    gtfs_data, coords, radius_km: float = 0.5, output_path: str = None
+) -> folium.Map:
     """
     Dibuja las paradas cercanas a unas coordenadas dadas.
 
@@ -535,7 +578,7 @@ def visualize_stops(gtfs_data, coords, radius_km: float = 0.5,
             color="#3388ff",
             fill=True,
             fill_opacity=0.8,
-            tooltip=f"{stop_id} ({distance*1000:.0f} m) — rutas: {', '.join(routes[:5])}",
+            tooltip=f"{stop_id} ({distance * 1000:.0f} m) — rutas: {', '.join(routes[:5])}",
         ).add_to(m)
 
     if output_path:

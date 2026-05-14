@@ -14,12 +14,13 @@ Implementación alineada con prácticas estándar de planificadores de transport
 - Perfiles de optimización: fastest, fewer_transfers, less_walking, balanced.
 """
 
+import heapq
 from collections import defaultdict
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import asin, cos, radians, sin, sqrt
-from typing import Dict, FrozenSet, Iterable, List, Literal, Optional, Set, Tuple
-import heapq
+from typing import Literal
 
 _EARTH_RADIUS_KM = 6371.0
 
@@ -35,42 +36,45 @@ class CSAConfig:
     """
 
     # Velocidades / distancias
-    walking_speed_kmh: float = 5.0           # 1.4 m/s — estándar peatón urbano
+    walking_speed_kmh: float = 5.0  # 1.4 m/s — estándar peatón urbano
 
     # Budgets de caminata por tramo (km) — Google/Citymapper-style
-    max_walking_to_stop_km: float = 1.0      # origen → primera parada y última parada → destino
-    max_walking_transfer_km: float = 0.4     # entre paradas al hacer transbordo
-    max_total_walking_km: float = 2.0        # tope global del viaje
-    max_direct_walk_km: float = 1.5          # si origen ↔ destino ≤ esto, sugerir caminar directo
+    max_walking_to_stop_km: float = 1.0  # origen → primera parada y última parada → destino
+    max_walking_transfer_km: float = 0.4  # entre paradas al hacer transbordo
+    max_total_walking_km: float = 2.0  # tope global del viaje
+    max_direct_walk_km: float = 1.5  # si origen ↔ destino ≤ esto, sugerir caminar directo
 
     # Transbordos
     max_transfers: int = 3
-    transfer_buffer_seconds: int = 60        # margen real de seguridad (espera mínima)
-    transfer_cost_penalty_seconds: int = 300 # penalty equivalente en costo (no en tiempo) por transbordo (OTP default ~600)
+    transfer_buffer_seconds: int = 60  # margen real de seguridad (espera mínima)
+    transfer_cost_penalty_seconds: int = (
+        300  # penalty equivalente en costo (no en tiempo) por transbordo (OTP default ~600)
+    )
 
     # Búsqueda
     time_horizon_hours: float = 3.0
     max_origin_stops: int = 8
     max_destination_stops: int = 8
-    fallback_step_minutes: float = 2.0       # estimación cuando no hay horario
+    fallback_step_minutes: float = 2.0  # estimación cuando no hay horario
 
 
 @dataclass(slots=True)
 class Journey:
     """Viaje completo con múltiples segmentos."""
 
-    segments: List[dict]
+    segments: list[dict]
     total_duration: timedelta
     departure_time: datetime
     arrival_time: datetime
     number_of_transfers: int
-    total_walking_distance: float            # en km
+    total_walking_distance: float  # en km
 
     def __lt__(self, other: "Journey") -> bool:
         """Orden lexicográfico (llegada, transbordos, caminata)."""
-        return (
-            (self.arrival_time, self.number_of_transfers, self.total_walking_distance)
-            < (other.arrival_time, other.number_of_transfers, other.total_walking_distance)
+        return (self.arrival_time, self.number_of_transfers, self.total_walking_distance) < (
+            other.arrival_time,
+            other.number_of_transfers,
+            other.total_walking_distance,
         )
 
     def __repr__(self) -> str:
@@ -80,11 +84,11 @@ class Journey:
             f"walk={self.total_walking_distance:.2f}km)"
         )
 
-    def transit_route_signature(self) -> Tuple[str, ...]:
+    def transit_route_signature(self) -> tuple[str, ...]:
         """Secuencia de route_ids del tránsito — sirve como clave de deduplicación."""
         return tuple(s["route_id"] for s in self.segments if s["type"] == "transit")
 
-    def transit_route_set(self) -> FrozenSet[str]:
+    def transit_route_set(self) -> frozenset[str]:
         return frozenset(self.transit_route_signature())
 
 
@@ -103,11 +107,11 @@ class ConnectionScanAlgorithm:
         self,
         gtfs_data,
         transfer_manager=None,
-        config: Optional[CSAConfig] = None,
+        config: CSAConfig | None = None,
         # — compatibilidad hacia atrás —
-        max_walking_distance_km: Optional[float] = None,
-        walking_speed_kmh: Optional[float] = None,
-        max_transfers: Optional[int] = None,
+        max_walking_distance_km: float | None = None,
+        walking_speed_kmh: float | None = None,
+        max_transfers: int | None = None,
     ):
         self.gtfs = gtfs_data
         self.transfer_manager = transfer_manager
@@ -140,12 +144,12 @@ class ConnectionScanAlgorithm:
 
     def find_journey(
         self,
-        origin_coords: Tuple[float, float],
-        destination_coords: Tuple[float, float],
+        origin_coords: tuple[float, float],
+        destination_coords: tuple[float, float],
         departure_time: datetime,
         num_alternatives: int = 3,
         profile: OptimizationProfile = "balanced",
-    ) -> List[Journey]:
+    ) -> list[Journey]:
         """Encuentra rutas óptimas entre dos coordenadas.
 
         Args:
@@ -168,14 +172,21 @@ class ConnectionScanAlgorithm:
 
         # ── Caminata directa: si destino está al alcance peatonal, sugerirlo
         direct_dist = self._haversine(
-            origin_coords[1], origin_coords[0],
-            destination_coords[1], destination_coords[0],
+            origin_coords[1],
+            origin_coords[0],
+            destination_coords[1],
+            destination_coords[0],
         )
-        direct_walks: List[Journey] = []
+        direct_walks: list[Journey] = []
         if direct_dist <= cfg.max_direct_walk_km:
-            direct_walks.append(self._build_direct_walk(
-                origin_coords, destination_coords, departure_time, direct_dist,
-            ))
+            direct_walks.append(
+                self._build_direct_walk(
+                    origin_coords,
+                    destination_coords,
+                    departure_time,
+                    direct_dist,
+                )
+            )
             # Política Google/Apple Maps: si el origen y destino están a distancia
             # razonablemente caminable, no tiene sentido proponer tránsito.
             if direct_dist <= cfg.max_walking_to_stop_km:
@@ -197,10 +208,10 @@ class ConnectionScanAlgorithm:
             return direct_walks
 
         # Diccionario destino → distancia de caminata egreso
-        dest_walk_dist: Dict[str, float] = dict(destination_stops)
+        dest_walk_dist: dict[str, float] = dict(destination_stops)
 
         # ── Búsqueda multi-target: una corrida por origen, todos los destinos
-        all_journeys: List[Journey] = []
+        all_journeys: list[Journey] = []
         for origin_stop, origin_dist in origin_stops:
             origin_walk_time = (origin_dist / cfg.walking_speed_kmh) * 3600
             arrival_at_origin_stop = departure_time + timedelta(seconds=origin_walk_time)
@@ -222,8 +233,9 @@ class ConnectionScanAlgorithm:
             return []
 
         # ── Filtrar: budgets totales, duplicados de secuencia de rutas
-        all_journeys = [j for j in all_journeys
-                        if j.total_walking_distance <= cfg.max_total_walking_km]
+        all_journeys = [
+            j for j in all_journeys if j.total_walking_distance <= cfg.max_total_walking_km
+        ]
         if not all_journeys:
             return direct_walks  # fallback razonable
 
@@ -247,13 +259,13 @@ class ConnectionScanAlgorithm:
     def _connection_scan_multi_target(
         self,
         origin_stop: str,
-        destination_walk_dist: Dict[str, float],
+        destination_walk_dist: dict[str, float],
         start_time: datetime,
-        origin_coords: Tuple[float, float],
-        destination_coords: Tuple[float, float],
+        origin_coords: tuple[float, float],
+        destination_coords: tuple[float, float],
         origin_walk_dist: float,
         actual_departure: datetime,
-    ) -> List[Journey]:
+    ) -> list[Journey]:
         """Una corrida de Dijkstra desde ``origin_stop`` que alcanza todos los
         destinos candidatos en ``destination_walk_dist``.
 
@@ -262,22 +274,20 @@ class ConnectionScanAlgorithm:
         están asentados o cuando se rebasa el horizonte temporal.
         """
         cfg = self.config
-        dest_set: Set[str] = set(destination_walk_dist.keys())
+        dest_set: set[str] = set(destination_walk_dist.keys())
         if not dest_set:
             return []
 
-        earliest_arrival: Dict[str, datetime] = {origin_stop: start_time}
-        in_connection: Dict[str, Tuple[str, str, datetime, datetime]] = {}
+        earliest_arrival: dict[str, datetime] = {origin_stop: start_time}
+        in_connection: dict[str, tuple[str, str, datetime, datetime]] = {}
 
         # (arrival_time, stop_id, current_route, num_transfers)
-        queue: List[Tuple[datetime, str, Optional[str], int]] = [
-            (start_time, origin_stop, None, 0)
-        ]
+        queue: list[tuple[datetime, str, str | None, int]] = [(start_time, origin_stop, None, 0)]
 
-        settled_state: Set[Tuple[str, Optional[str]]] = set()
-        visited_route_at_stop: Set[Tuple[str, str]] = set()
+        settled_state: set[tuple[str, str | None]] = set()
+        visited_route_at_stop: set[tuple[str, str]] = set()
 
-        reached: Dict[str, Journey] = {}
+        reached: dict[str, Journey] = {}
         time_horizon = start_time + timedelta(hours=cfg.time_horizon_hours)
         transfer_step = timedelta(
             seconds=cfg.transfer_buffer_seconds + 60  # buffer + tiempo de embarque típico
@@ -338,11 +348,16 @@ class ConnectionScanAlgorithm:
 
                 new_transfers = num_transfers + (1 if needs_transfer else 0)
                 for next_stop, next_arrival_time in next_stops:
-                    if (next_stop not in earliest_arrival
-                            or next_arrival_time < earliest_arrival[next_stop]):
+                    if (
+                        next_stop not in earliest_arrival
+                        or next_arrival_time < earliest_arrival[next_stop]
+                    ):
                         earliest_arrival[next_stop] = next_arrival_time
                         in_connection[next_stop] = (
-                            current_stop, route_id, dep_time, next_arrival_time,
+                            current_stop,
+                            route_id,
+                            dep_time,
+                            next_arrival_time,
                         )
                         heapq.heappush(
                             queue,
@@ -355,7 +370,7 @@ class ConnectionScanAlgorithm:
     # Helpers de grafo / red GTFS
     # ────────────────────────────────────────────────────────────────────────
 
-    def _get_routes_at_stop(self, stop_id: str) -> List[str]:
+    def _get_routes_at_stop(self, stop_id: str) -> list[str]:
         return self._stop_to_routes.get(stop_id, [])
 
     def _is_transfer_viable(self, from_route: str, stop_id: str, to_route: str) -> bool:
@@ -373,7 +388,7 @@ class ConnectionScanAlgorithm:
         route_id: str,
         current_stop: str,
         current_time: datetime,
-    ) -> List[Tuple[str, datetime]]:
+    ) -> list[tuple[str, datetime]]:
         graph = self.gtfs.graphs.get(route_id)
         node_map = self.gtfs._graph_node_maps.get(route_id)
         idx_to_node = self.gtfs._graph_idx_to_node.get(route_id)
@@ -389,7 +404,7 @@ class ConnectionScanAlgorithm:
         route_stops = self.gtfs.route_stops.get(route_id, {})
         current_time_only = current_time.time()
         fallback_step = timedelta(minutes=self.config.fallback_step_minutes)
-        results: List[Tuple[str, datetime]] = []
+        results: list[tuple[str, datetime]] = []
 
         for next_idx in successor_indices:
             next_stop_id = idx_to_node.get(next_idx)
@@ -399,7 +414,7 @@ class ConnectionScanAlgorithm:
             next_info = route_stops.get(next_stop_id, {})
             arrival_times = next_info.get("arrival_times") or ()
 
-            next_arrival_dt: Optional[datetime] = None
+            next_arrival_dt: datetime | None = None
             for t in arrival_times:
                 if t >= current_time_only:
                     next_arrival_dt = datetime.combine(current_time.date(), t)
@@ -420,25 +435,27 @@ class ConnectionScanAlgorithm:
 
     def _build_direct_walk(
         self,
-        origin_coords: Tuple[float, float],
-        destination_coords: Tuple[float, float],
+        origin_coords: tuple[float, float],
+        destination_coords: tuple[float, float],
         departure_time: datetime,
         distance_km: float,
     ) -> Journey:
         walk_time_sec = (distance_km / self.config.walking_speed_kmh) * 3600
         end_time = departure_time + timedelta(seconds=walk_time_sec)
         return Journey(
-            segments=[{
-                "type": "walk",
-                "from": "origin",
-                "to": "destination",
-                "from_latlon": list(origin_coords),
-                "to_latlon": list(destination_coords),
-                "distance_km": distance_km,
-                "duration": timedelta(seconds=walk_time_sec),
-                "start_time": departure_time,
-                "end_time": end_time,
-            }],
+            segments=[
+                {
+                    "type": "walk",
+                    "from": "origin",
+                    "to": "destination",
+                    "from_latlon": list(origin_coords),
+                    "to_latlon": list(destination_coords),
+                    "distance_km": distance_km,
+                    "duration": timedelta(seconds=walk_time_sec),
+                    "start_time": departure_time,
+                    "end_time": end_time,
+                }
+            ],
             total_duration=timedelta(seconds=walk_time_sec),
             departure_time=departure_time,
             arrival_time=end_time,
@@ -450,18 +467,18 @@ class ConnectionScanAlgorithm:
         self,
         origin_stop: str,
         destination_stop: str,
-        in_connection: Dict[str, Tuple[str, str, datetime, datetime]],
-        origin_coords: Tuple[float, float],
-        destination_coords: Tuple[float, float],
+        in_connection: dict[str, tuple[str, str, datetime, datetime]],
+        origin_coords: tuple[float, float],
+        destination_coords: tuple[float, float],
         origin_walk_dist: float,
         dest_walk_dist: float,
         actual_departure: datetime,
-    ) -> Optional[Journey]:
+    ) -> Journey | None:
         if destination_stop not in in_connection:
             return None
 
         # Camino inverso: destination → origin
-        path: List[Tuple[str, str, str, datetime, datetime]] = []
+        path: list[tuple[str, str, str, datetime, datetime]] = []
         current = destination_stop
         while current != origin_stop:
             entry = in_connection.get(current)
@@ -472,45 +489,51 @@ class ConnectionScanAlgorithm:
             current = from_stop
         path.reverse()
 
-        segments: List[dict] = []
+        segments: list[dict] = []
         cfg = self.config
         transfer_duration = timedelta(seconds=cfg.transfer_buffer_seconds)
 
         # Caminata inicial
         walk_time_sec = (origin_walk_dist / cfg.walking_speed_kmh) * 3600
-        segments.append({
-            "type": "walk",
-            "from": "origin",
-            "to": origin_stop,
-            "from_latlon": [origin_coords[0], origin_coords[1]],
-            "distance_km": origin_walk_dist,
-            "duration": timedelta(seconds=walk_time_sec),
-            "start_time": actual_departure,
-            "end_time": actual_departure + timedelta(seconds=walk_time_sec),
-        })
+        segments.append(
+            {
+                "type": "walk",
+                "from": "origin",
+                "to": origin_stop,
+                "from_latlon": [origin_coords[0], origin_coords[1]],
+                "distance_km": origin_walk_dist,
+                "duration": timedelta(seconds=walk_time_sec),
+                "start_time": actual_departure,
+                "end_time": actual_departure + timedelta(seconds=walk_time_sec),
+            }
+        )
 
         # Tránsito + transbordos
         num_transfers = 0
-        prev_route: Optional[str] = None
+        prev_route: str | None = None
         for from_stop, to_stop, route_id, dep_time, arr_time in path:
             if prev_route is not None and prev_route != route_id:
                 num_transfers += 1
-                segments.append({
-                    "type": "transfer",
-                    "from_route": prev_route,
-                    "to_route": route_id,
-                    "at_stop": from_stop,
-                    "duration": transfer_duration,
-                })
-            segments.append({
-                "type": "transit",
-                "route_id": route_id,
-                "from_stop": from_stop,
-                "to_stop": to_stop,
-                "departure_time": dep_time,
-                "arrival_time": arr_time,
-                "duration": arr_time - dep_time,
-            })
+                segments.append(
+                    {
+                        "type": "transfer",
+                        "from_route": prev_route,
+                        "to_route": route_id,
+                        "at_stop": from_stop,
+                        "duration": transfer_duration,
+                    }
+                )
+            segments.append(
+                {
+                    "type": "transit",
+                    "route_id": route_id,
+                    "from_stop": from_stop,
+                    "to_stop": to_stop,
+                    "departure_time": dep_time,
+                    "arrival_time": arr_time,
+                    "duration": arr_time - dep_time,
+                }
+            )
             prev_route = route_id
 
         # Caminata final
@@ -520,16 +543,18 @@ class ConnectionScanAlgorithm:
             if segments[-1]["type"] == "transit"
             else segments[-1]["end_time"]
         )
-        segments.append({
-            "type": "walk",
-            "from": destination_stop,
-            "to": "destination",
-            "to_latlon": [destination_coords[0], destination_coords[1]],
-            "distance_km": dest_walk_dist,
-            "duration": timedelta(seconds=final_walk_time_sec),
-            "start_time": last_end,
-            "end_time": last_end + timedelta(seconds=final_walk_time_sec),
-        })
+        segments.append(
+            {
+                "type": "walk",
+                "from": destination_stop,
+                "to": "destination",
+                "to_latlon": [destination_coords[0], destination_coords[1]],
+                "distance_km": dest_walk_dist,
+                "duration": timedelta(seconds=final_walk_time_sec),
+                "start_time": last_end,
+                "end_time": last_end + timedelta(seconds=final_walk_time_sec),
+            }
+        )
 
         total_duration = segments[-1]["end_time"] - segments[0]["start_time"]
         total_walking = origin_walk_dist + dest_walk_dist
@@ -548,10 +573,10 @@ class ConnectionScanAlgorithm:
     # ────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _filter_similar_journeys(journeys: Iterable[Journey]) -> List[Journey]:
+    def _filter_similar_journeys(journeys: Iterable[Journey]) -> list[Journey]:
         """Filtra viajes con idéntica secuencia de rutas de tránsito."""
-        seen: Set[Tuple[str, ...]] = set()
-        unique: List[Journey] = []
+        seen: set[tuple[str, ...]] = set()
+        unique: list[Journey] = []
         for journey in journeys:
             key = journey.transit_route_signature() or ("__walk__",)
             if key not in seen:
@@ -560,7 +585,7 @@ class ConnectionScanAlgorithm:
         return unique
 
     @staticmethod
-    def _pareto_filter(journeys: List[Journey]) -> List[Journey]:
+    def _pareto_filter(journeys: list[Journey]) -> list[Journey]:
         """Pareto 3D sobre (arrival_time, num_transfers, walking_distance).
 
         Implementación: ordena por (arrival, transfers, walking); para cada
@@ -575,7 +600,7 @@ class ConnectionScanAlgorithm:
             key=lambda j: (j.arrival_time, j.number_of_transfers, j.total_walking_distance),
         )
 
-        pareto: List[Journey] = []
+        pareto: list[Journey] = []
         for candidate in ordered:
             c_arr = candidate.arrival_time
             c_xfer = candidate.number_of_transfers
@@ -587,8 +612,12 @@ class ConnectionScanAlgorithm:
                 a_walk = accepted.total_walking_distance
                 # `accepted` domina a `candidate` si es <= en las tres dims
                 # y < en al menos una.
-                if (a_arr <= c_arr and a_xfer <= c_xfer and a_walk <= c_walk
-                        and (a_arr < c_arr or a_xfer < c_xfer or a_walk < c_walk)):
+                if (
+                    a_arr <= c_arr
+                    and a_xfer <= c_xfer
+                    and a_walk <= c_walk
+                    and (a_arr < c_arr or a_xfer < c_xfer or a_walk < c_walk)
+                ):
                     dominated = True
                     break
             if not dominated:
@@ -598,13 +627,13 @@ class ConnectionScanAlgorithm:
 
     @staticmethod
     def _add_diverse_alternatives(
-        pareto: List[Journey],
-        candidates: List[Journey],
+        pareto: list[Journey],
+        candidates: list[Journey],
         target: int,
-    ) -> List[Journey]:
+    ) -> list[Journey]:
         """Rellena el Pareto con journeys dominados pero con set de rutas distinto."""
         result = list(pareto)
-        used: Set[FrozenSet[str]] = {j.transit_route_set() for j in result}
+        used: set[frozenset[str]] = {j.transit_route_set() for j in result}
         for journey in candidates:
             if len(result) >= target:
                 break
@@ -617,9 +646,9 @@ class ConnectionScanAlgorithm:
 
     def _sort_by_profile(
         self,
-        journeys: List[Journey],
+        journeys: list[Journey],
         profile: OptimizationProfile,
-    ) -> List[Journey]:
+    ) -> list[Journey]:
         """Ordena los viajes del Pareto según el perfil pedido."""
         cfg = self.config
 
@@ -661,8 +690,8 @@ class ConnectionScanAlgorithm:
 
     @staticmethod
     def _validate_inputs(
-        origin_coords: Tuple[float, float],
-        destination_coords: Tuple[float, float],
+        origin_coords: tuple[float, float],
+        destination_coords: tuple[float, float],
         departure_time: datetime,
     ) -> None:
         if not isinstance(origin_coords, tuple) or len(origin_coords) != 2:
@@ -685,11 +714,11 @@ class ConnectionScanAlgorithm:
 def create_csa_planner(
     gtfs_data,
     transfer_manager=None,
-    config: Optional[CSAConfig] = None,
+    config: CSAConfig | None = None,
     # — compat hacia atrás —
-    max_walking_km: Optional[float] = None,
-    walking_speed_kmh: Optional[float] = None,
-    max_transfers: Optional[int] = None,
+    max_walking_km: float | None = None,
+    walking_speed_kmh: float | None = None,
+    max_transfers: int | None = None,
 ) -> ConnectionScanAlgorithm:
     """Factory de ConnectionScanAlgorithm.
 

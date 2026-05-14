@@ -1,13 +1,10 @@
-from pyprojroot import here
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import (
-    Union,
-    Callable,
-    Iterable,
-)
+
+from pyprojroot import here
 
 
-def make_dir_function(dir_name: Union[str, Iterable[str]]) -> Callable[..., Path]:
+def make_dir_function(dir_name: str | Iterable[str]) -> Callable[..., Path]:
     """Generate a fucntion that converts a string or iterable of strings into
     a path relative to the project directory.
 

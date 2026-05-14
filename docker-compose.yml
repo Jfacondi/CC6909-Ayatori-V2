@@ -13,3 +13,9 @@ services:
       AYATORI_TRANSFERS_CACHE: ayatori/data/cache/transfers.json
       AYATORI_TRANSFERS_MAX_DIST_KM: "0.5"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=2); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 3

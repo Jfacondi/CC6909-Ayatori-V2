@@ -1,0 +1,22 @@
+# Manifest de datasets que `ayatori-fetch-data` descarga.
+#
+# Cada bloque describe un dataset:
+#   url     URL de descarga directa
+#   sha256  (opcional) hash esperado del archivo descargado; si está, se verifica
+#   dest    ruta destino relativa al root del repo
+#   extract (opcional) si el archivo es .zip, extraerlo en dest
+#
+# Las URLs reales del feed DTPM cambian con frecuencia — ajustar según
+# https://www.dtpm.cl/index.php/2013-04-29-20-33-57/gtfs-vigente cuando aplique.
+
+[datasets."gtfs.2023-09-16"]
+url = "https://www.dtpm.cl/descargas/gtfs/GTFS-V100-PO20230916.zip"
+sha256 = ""
+dest = "ayatori/data/GTFS/2023-09-16"
+extract = true
+
+[datasets."osm.santiago"]
+url = "https://download.geofabrik.de/south-america/chile-latest.osm.pbf"
+sha256 = ""
+dest = "ayatori/data/OSM/Santiago.osm.pbf"
+extract = false

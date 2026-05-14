@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 OptimizationProfile = Literal["fastest", "fewer_transfers", "less_walking", "balanced"]
-LatLon = Tuple[float, float]
+LatLon = tuple[float, float]
 
 
 class ConfigOverride(BaseModel):
@@ -20,18 +20,18 @@ class ConfigOverride(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    walking_speed_kmh: Optional[float] = Field(None, ge=1.0, le=10.0)
-    max_walking_to_stop_km: Optional[float] = Field(None, ge=0.05, le=5.0)
-    max_walking_transfer_km: Optional[float] = Field(None, ge=0.05, le=5.0)
-    max_total_walking_km: Optional[float] = Field(None, ge=0.05, le=10.0)
-    max_direct_walk_km: Optional[float] = Field(None, ge=0.05, le=10.0)
-    max_transfers: Optional[int] = Field(None, ge=0, le=6)
-    transfer_buffer_seconds: Optional[int] = Field(None, ge=0, le=1800)
-    transfer_cost_penalty_seconds: Optional[int] = Field(None, ge=0, le=3600)
-    time_horizon_hours: Optional[float] = Field(None, ge=0.5, le=12.0)
-    max_origin_stops: Optional[int] = Field(None, ge=1, le=30)
-    max_destination_stops: Optional[int] = Field(None, ge=1, le=30)
-    fallback_step_minutes: Optional[float] = Field(None, ge=0.5, le=30.0)
+    walking_speed_kmh: float | None = Field(None, ge=1.0, le=10.0)
+    max_walking_to_stop_km: float | None = Field(None, ge=0.05, le=5.0)
+    max_walking_transfer_km: float | None = Field(None, ge=0.05, le=5.0)
+    max_total_walking_km: float | None = Field(None, ge=0.05, le=10.0)
+    max_direct_walk_km: float | None = Field(None, ge=0.05, le=10.0)
+    max_transfers: int | None = Field(None, ge=0, le=6)
+    transfer_buffer_seconds: int | None = Field(None, ge=0, le=1800)
+    transfer_cost_penalty_seconds: int | None = Field(None, ge=0, le=3600)
+    time_horizon_hours: float | None = Field(None, ge=0.5, le=12.0)
+    max_origin_stops: int | None = Field(None, ge=1, le=30)
+    max_destination_stops: int | None = Field(None, ge=1, le=30)
+    fallback_step_minutes: float | None = Field(None, ge=0.5, le=30.0)
 
 
 class PlanRequest(BaseModel):
@@ -42,16 +42,16 @@ class PlanRequest(BaseModel):
     departure: datetime
     num_alternatives: int = Field(3, ge=1, le=10)
     profile: OptimizationProfile = "balanced"
-    config: Optional[ConfigOverride] = None
+    config: ConfigOverride | None = None
 
 
 class LabeledConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     label: str = Field(..., min_length=1, max_length=64)
-    config: Optional[ConfigOverride] = None
-    profile: Optional[OptimizationProfile] = None
-    num_alternatives: Optional[int] = Field(None, ge=1, le=10)
+    config: ConfigOverride | None = None
+    profile: OptimizationProfile | None = None
+    num_alternatives: int | None = Field(None, ge=1, le=10)
 
 
 class ComparePlanRequest(BaseModel):
@@ -60,7 +60,7 @@ class ComparePlanRequest(BaseModel):
     origin: LatLon
     destination: LatLon
     departure: datetime
-    variants: List[LabeledConfig] = Field(..., min_length=1, max_length=6)
+    variants: list[LabeledConfig] = Field(..., min_length=1, max_length=6)
 
 
 class SegmentDTO(BaseModel):
@@ -73,26 +73,26 @@ class SegmentDTO(BaseModel):
     type: Literal["walk", "transit", "transfer"]
     duration_seconds: float
     # walk / transit
-    from_: Optional[str] = Field(None, alias="from")
-    to: Optional[str] = None
-    from_latlon: Optional[List[float]] = None
-    to_latlon: Optional[List[float]] = None
-    distance_km: Optional[float] = None
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
+    from_: str | None = Field(None, alias="from")
+    to: str | None = None
+    from_latlon: list[float] | None = None
+    to_latlon: list[float] | None = None
+    distance_km: float | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
     # transit
-    route_id: Optional[str] = None
-    from_stop: Optional[str] = None
-    to_stop: Optional[str] = None
-    departure_time: Optional[datetime] = None
-    arrival_time: Optional[datetime] = None
+    route_id: str | None = None
+    from_stop: str | None = None
+    to_stop: str | None = None
+    departure_time: datetime | None = None
+    arrival_time: datetime | None = None
     # transfer
-    from_route: Optional[str] = None
-    to_route: Optional[str] = None
-    at_stop: Optional[str] = None
+    from_route: str | None = None
+    to_route: str | None = None
+    at_stop: str | None = None
     # geometría enriquecida en el handler (no la produce CSA)
-    from_coords: Optional[List[float]] = None
-    to_coords: Optional[List[float]] = None
+    from_coords: list[float] | None = None
+    to_coords: list[float] | None = None
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -103,24 +103,24 @@ class JourneyDTO(BaseModel):
     arrival_time: datetime
     number_of_transfers: int
     total_walking_distance_km: float
-    segments: List[SegmentDTO]
+    segments: list[SegmentDTO]
 
 
 class PlanResponse(BaseModel):
     config_used: dict
     profile: OptimizationProfile
-    journeys: List[JourneyDTO]
+    journeys: list[JourneyDTO]
 
 
 class CompareVariantResponse(BaseModel):
     label: str
     config_used: dict
     profile: OptimizationProfile
-    journeys: List[JourneyDTO]
+    journeys: list[JourneyDTO]
 
 
 class ComparePlanResponse(BaseModel):
-    results: List[CompareVariantResponse]
+    results: list[CompareVariantResponse]
 
 
 class NearbyStop(BaseModel):

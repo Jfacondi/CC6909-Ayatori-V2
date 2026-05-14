@@ -1,12 +1,11 @@
-from geopy.geocoders import Nominatim
-from datetime import datetime, date, time, timedelta
-import time as tm
-import pandas as pd
-import folium
-import OSMGraph
-import GTFSData
-from utils import find_nearest_stops, find_route_nodes, available_route_finder, find_best_option
+from datetime import date, datetime, timedelta
 
+import folium
+import GTFSData
+import OSMGraph
+import pandas as pd
+from geopy.geocoders import Nominatim
+from utils import available_route_finder, find_best_option
 
 osm_graph = OSMGraph()
 gtfs_data = GTFSData()
@@ -90,12 +89,12 @@ def connection_scan_lite(source_address, target_address, departure_time, departu
         # Add markers for the source and target points
         folium.Marker(
             location=[selected_path[0][0], selected_path[0][1]],
-            popup="Origen: {}".format(source),
+            popup=f"Origen: {source}",
             icon=folium.Icon(color="green"),
         ).add_to(m)
         folium.Marker(
             location=[selected_path[-1][0], selected_path[-1][1]],
-            popup="Destino: {}".format(target),
+            popup=f"Destino: {target}",
             icon=folium.Icon(color="red"),
         ).add_to(m)
 
@@ -147,25 +146,21 @@ def connection_scan_lite(source_address, target_address, departure_time, departu
         walking_minutes, walking_seconds = gtfs_data.timedelta_separator(initial_delta_time)
 
         print("")
-        print("To go from: {}".format(source))
-        print("To: {}".format(target))
+        print(f"To go from: {source}")
+        print(f"To: {target}")
         best_arrival_time_str = gtfs_data.timedelta_to_hhmm(best_option[2])
         print("")
         if possible_metro_name is not None:  # Changes the printing to adapt for the use of Metro
             print(
-                "The best option is to walk for {} minutes and {} seconds to {} Metro station, and take the line {}.".format(
-                    walking_minutes, walking_seconds, source_stop, best_option[0]
-                )
+                f"The best option is to walk for {walking_minutes} minutes and {walking_seconds} seconds to {source_stop} Metro station, and take the line {best_option[0]}."
             )
-            print("The next train arrives at {}.".format(best_arrival_time_str))
+            print(f"The next train arrives at {best_arrival_time_str}.")
             print("The other two next trains arrives in:")
         else:
             print(
-                "The best option is to walk for {} minutes and {} seconds to stop {}, and take the route {}.".format(
-                    walking_minutes, walking_seconds, source_stop, best_option[0]
-                )
+                f"The best option is to walk for {walking_minutes} minutes and {walking_seconds} seconds to stop {source_stop}, and take the route {best_option[0]}."
             )
-            print("The next bus arrives at {}.".format(best_arrival_time_str))
+            print(f"The next bus arrives at {best_arrival_time_str}.")
             print("The other two next buses arrives in:")
 
         # Format and prints the times
@@ -198,9 +193,7 @@ def connection_scan_lite(source_address, target_address, departure_time, departu
                         # Maps the best option to take the best option's service
                         folium.Marker(
                             location=[stop_coords[1], stop_coords[0]],
-                            popup="Mejor opción: subirse al recorrido {} en la parada {}.".format(
-                                best_option[0], best_option[1]
-                            ),
+                            popup=f"Mejor opción: subirse al recorrido {best_option[0]} en la parada {best_option[1]}.",
                             icon=folium.Icon(color="cadetblue", icon="plus"),
                         ).add_to(m)
                         initial_distance = [
@@ -283,23 +276,17 @@ def connection_scan_lite(source_address, target_address, departure_time, departu
                 print("")
                 if possible_metro_name is not None:  # Changes the message
                     print(
-                        "You will get off the train on {} station after {} minutes and {} seconds.".format(
-                            selected_stop, minutes, seconds
-                        )
+                        f"You will get off the train on {selected_stop} station after {minutes} minutes and {seconds} seconds."
                     )
                 else:
                     print(
-                        "You will get off the bus on stop {} after {} minutes and {} seconds.".format(
-                            selected_stop, minutes, seconds
-                        )
+                        f"You will get off the bus on stop {selected_stop} after {minutes} minutes and {seconds} seconds."
                     )
 
                 # Maps the best option to get off the best option's service
                 folium.Marker(
                     location=[selected_stop_coords[1], selected_stop_coords[0]],
-                    popup="Mejor opción: bajarse del recorrido {} en la parada {}.".format(
-                        best_option[0], selected_stop
-                    ),
+                    popup=f"Mejor opción: bajarse del recorrido {best_option[0]} en la parada {selected_stop}.",
                     icon=folium.Icon(color="cadetblue", icon="plus"),
                 ).add_to(m)
                 ending_distance = [

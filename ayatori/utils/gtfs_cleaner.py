@@ -3,12 +3,12 @@ GTFS Cleaner Module
 Handles cleaning and validation of GTFS data with missing or invalid coordinates.
 """
 
-import zipfile
 import csv
-import tempfile
-import shutil
-from pathlib import Path
 import logging
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -53,15 +53,11 @@ def clean_gtfs_stops(gtfs_zip_path):
 
             # Write cleaned stops.txt
             if cleaned_rows:
-                with open(
-                    stops_file, "w", encoding="utf-8", newline=""
-                ) as f:
+                with open(stops_file, "w", encoding="utf-8", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=cleaned_rows[0].keys())
                     writer.writeheader()
                     writer.writerows(cleaned_rows)
-                    logger.info(
-                        f"Cleaned {len(cleaned_rows)} valid stops from GTFS"
-                    )
+                    logger.info(f"Cleaned {len(cleaned_rows)} valid stops from GTFS")
             else:
                 logger.warning("No valid stops found after cleaning!")
 
@@ -93,7 +89,7 @@ def _clean_stops_file(stops_file_path):
     """
     cleaned_rows = []
 
-    with open(stops_file_path, "r", encoding="utf-8") as f:
+    with open(stops_file_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
         for row_num, row in enumerate(reader, start=2):  # Start at 2 (after header)
@@ -103,9 +99,7 @@ def _clean_stops_file(stops_file_path):
 
             # Validate coordinates exist
             if not lat_str or not lon_str:
-                logger.debug(
-                    f"Row {row_num}: Stop '{stop_id}' has missing coordinates"
-                )
+                logger.debug(f"Row {row_num}: Stop '{stop_id}' has missing coordinates")
                 continue
 
             # Validate coordinates are numeric
@@ -122,8 +116,7 @@ def _clean_stops_file(stops_file_path):
             # Validate coordinates are in valid range (WGS84)
             if not (-90 <= lat <= 90 and -180 <= lon <= 180):
                 logger.debug(
-                    f"Row {row_num}: Stop '{stop_id}' has out-of-range coordinates: "
-                    f"({lat}, {lon})"
+                    f"Row {row_num}: Stop '{stop_id}' has out-of-range coordinates: ({lat}, {lon})"
                 )
                 continue
 

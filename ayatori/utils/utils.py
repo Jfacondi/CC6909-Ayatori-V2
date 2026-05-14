@@ -1,5 +1,6 @@
-from datetime import datetime, date, time, timedelta
 from collections import defaultdict
+from datetime import date, datetime, timedelta
+
 import folium
 
 
@@ -369,7 +370,11 @@ def calculate_stop_density(osm_graph, gtfs_data):
                 else (
                     "yellow"
                     if num_routes >= 3
-                    else "green" if num_routes >= 2 else "blue" if num_routes >= 1 else "purple"
+                    else "green"
+                    if num_routes >= 2
+                    else "blue"
+                    if num_routes >= 1
+                    else "purple"
                 )
             )
         )

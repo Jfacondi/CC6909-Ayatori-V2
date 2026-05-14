@@ -79,9 +79,14 @@ class OSMGraph:
             node_id = row["id"]
             node_coords[node_id] = (lat, lon)
 
-            idx = graph.add_node({
-                "lon": lon, "lat": lat, "graph_id": index, "node_id": node_id,
-            })
+            idx = graph.add_node(
+                {
+                    "lon": lon,
+                    "lat": lat,
+                    "graph_id": index,
+                    "node_id": node_id,
+                }
+            )
             node_id_to_idx[node_id] = idx
 
         for _, row in edges.iterrows():
@@ -121,8 +126,7 @@ class OSMGraph:
     def get_nodes_and_edges(self):
         nodes = list(self._node_id_to_idx.keys())
         edges = [
-            (self._idx_to_node_id[u], self._idx_to_node_id[v])
-            for u, v in self.graph.edge_list()
+            (self._idx_to_node_id[u], self._idx_to_node_id[v]) for u, v in self.graph.edge_list()
         ]
         return nodes, edges
 

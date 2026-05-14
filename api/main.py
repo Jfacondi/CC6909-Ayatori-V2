@@ -31,7 +31,6 @@ from .schemas import (
     CompareVariantResponse,
     ConfigOverride,
     HealthResponse,
-    LabeledConfig,
     NearbyStop,
     PlanRequest,
     PlanResponse,
@@ -60,8 +59,9 @@ async def lifespan(app: FastAPI):
     gtfs_path = Path(DEFAULT_GTFS)
     if not gtfs_path.exists():
         raise RuntimeError(
-            f"GTFS file not found at {gtfs_path.resolve()}. "
-            f"Set AYATORI_GTFS_PATH env var to override."
+            f"GTFS file not found at {gtfs_path.resolve()}.\n"
+            f"  - Run `ayatori-fetch-data` to download it (see ayatori/data/manifest.toml), or\n"
+            f"  - Set AYATORI_GTFS_PATH to point to an existing feed."
         )
 
     logger.info("Loading GTFS from %s", gtfs_path)
@@ -154,22 +154,21 @@ def config_schema():
     es metadata pragmática)."""
     defaults = asdict(CSAConfig())
     bounds = {
-        "walking_speed_kmh":               {"min": 1.0,  "max": 10.0, "step": 0.1},
-        "max_walking_to_stop_km":          {"min": 0.05, "max": 5.0,  "step": 0.05},
-        "max_walking_transfer_km":         {"min": 0.05, "max": 5.0,  "step": 0.05},
-        "max_total_walking_km":            {"min": 0.05, "max": 10.0, "step": 0.1},
-        "max_direct_walk_km":              {"min": 0.05, "max": 10.0, "step": 0.1},
-        "max_transfers":                   {"min": 0,    "max": 6,    "step": 1},
-        "transfer_buffer_seconds":         {"min": 0,    "max": 1800, "step": 30},
-        "transfer_cost_penalty_seconds":   {"min": 0,    "max": 3600, "step": 30},
-        "time_horizon_hours":              {"min": 0.5,  "max": 12.0, "step": 0.5},
-        "max_origin_stops":                {"min": 1,    "max": 30,   "step": 1},
-        "max_destination_stops":           {"min": 1,    "max": 30,   "step": 1},
-        "fallback_step_minutes":           {"min": 0.5,  "max": 30.0, "step": 0.5},
+        "walking_speed_kmh": {"min": 1.0, "max": 10.0, "step": 0.1},
+        "max_walking_to_stop_km": {"min": 0.05, "max": 5.0, "step": 0.05},
+        "max_walking_transfer_km": {"min": 0.05, "max": 5.0, "step": 0.05},
+        "max_total_walking_km": {"min": 0.05, "max": 10.0, "step": 0.1},
+        "max_direct_walk_km": {"min": 0.05, "max": 10.0, "step": 0.1},
+        "max_transfers": {"min": 0, "max": 6, "step": 1},
+        "transfer_buffer_seconds": {"min": 0, "max": 1800, "step": 30},
+        "transfer_cost_penalty_seconds": {"min": 0, "max": 3600, "step": 30},
+        "time_horizon_hours": {"min": 0.5, "max": 12.0, "step": 0.5},
+        "max_origin_stops": {"min": 1, "max": 30, "step": 1},
+        "max_destination_stops": {"min": 1, "max": 30, "step": 1},
+        "fallback_step_minutes": {"min": 0.5, "max": 30.0, "step": 0.5},
     }
     return {
-        f.name: {"default": defaults[f.name], **bounds.get(f.name, {})}
-        for f in fields(CSAConfig())
+        f.name: {"default": defaults[f.name], **bounds.get(f.name, {})} for f in fields(CSAConfig())
     }
 
 
@@ -198,8 +197,12 @@ def plan(req: PlanRequest):
     _require_state()
     cfg = _config_from_override(req.config)
     dtos = _run_plan(
-        req.origin, req.destination, req.departure,
-        req.profile, req.num_alternatives, cfg,
+        req.origin,
+        req.destination,
+        req.departure,
+        req.profile,
+        req.num_alternatives,
+        cfg,
     )
     return PlanResponse(
         config_used=asdict(cfg),
@@ -217,15 +220,21 @@ def plan_compare(req: ComparePlanRequest):
         profile = variant.profile or "balanced"
         n = variant.num_alternatives or 3
         dtos = _run_plan(
-            req.origin, req.destination, req.departure,
-            profile, n, cfg,
+            req.origin,
+            req.destination,
+            req.departure,
+            profile,
+            n,
+            cfg,
         )
-        results.append(CompareVariantResponse(
-            label=variant.label,
-            config_used=asdict(cfg),
-            profile=profile,
-            journeys=dtos,
-        ))
+        results.append(
+            CompareVariantResponse(
+                label=variant.label,
+                config_used=asdict(cfg),
+                profile=profile,
+                journeys=dtos,
+            )
+        )
     return ComparePlanResponse(results=results)
 
 

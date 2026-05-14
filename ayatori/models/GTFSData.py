@@ -2,7 +2,7 @@ import logging
 import os
 import warnings
 from collections import defaultdict
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, time, timedelta
 from math import asin, cos, radians, sin, sqrt
 
 import folium
@@ -18,10 +18,31 @@ _EARTH_RADIUS_KM = 6371.0
 
 
 class GTFSData:
+    """Lectura de un feed GTFS y construcción de índices para ruteo.
+
+    Carga un GTFS (.zip o directorio extraído) en memoria vía pygtfs y construye
+    estructuras necesarias para el motor CSA: un cKDTree espacial sobre las
+    paradas, un grafo dirigido por ruta (rustworkx), y dos índices invertidos
+    (parada→rutas, parada→coords) que permiten consultas O(1).
+
+    Attributes:
+        scheduler: ``pygtfs.Schedule`` con el feed cargado.
+        route_stops: ``{route_id: {stop_id: {sequence, coordinates, arrival_times}}}``.
+        stops: conjunto de stop_ids vistos en alguna ruta.
+        special_dates: feriados / excepciones del calendar.
+        graphs: ``{route_id: rustworkx.PyDiGraph}`` por ruta.
+        transfer_manager: presente después de ``get_or_compute_transfers``.
+
+    Example:
+        >>> gtfs = GTFSData("santiago-gtfs.zip")
+        >>> tm = gtfs.get_or_compute_transfers(cache_path="cache.json")
+        >>> nearby = gtfs.get_nearby_stops((-33.43, -70.65), margin_km=0.5)
+    """
+
     def __init__(self, GTFS_PATH="gtfs.zip"):
         self.scheduler = self.create_scheduler(GTFS_PATH)
         self.graphs = {}
-        self._graph_node_maps = {}    # {route_id: {stop_id: rx_idx}}
+        self._graph_node_maps = {}  # {route_id: {stop_id: rx_idx}}
         self._graph_idx_to_node = {}  # {route_id: {rx_idx: stop_id}}
         self.route_stops = {}
         self.special_dates = []
@@ -44,7 +65,7 @@ class GTFSData:
                     coords.append([lat, lon])
                 except (ValueError, TypeError):
                     continue
-        
+
         if coords:
             self._stop_coords_array = np.array(coords)
             self._spatial_tree = cKDTree(self._stop_coords_array)
@@ -90,11 +111,11 @@ class GTFSData:
         pygtfs.Schedule: the scheduler object
         """
         # Suprimir advertencias de pygtfs sobre paradas inválidas
-        logging.getLogger('pygtfs').setLevel(logging.ERROR)
-        warnings.filterwarnings('ignore')
-        
+        logging.getLogger("pygtfs").setLevel(logging.ERROR)
+        warnings.filterwarnings("ignore")
+
         gtfs_to_use = GTFS_PATH
-        
+
         # Intentar cargar GTFS directamente
         try:
             scheduler = pygtfs.Schedule(":memory:")
@@ -135,7 +156,7 @@ class GTFSData:
 
         for route in sched.routes:
             graph = rx.PyDiGraph()
-            node_map = {}    # {stop_id: rx_idx}
+            node_map = {}  # {stop_id: rx_idx}
             idx_to_node = {}  # {rx_idx: stop_id}
             stop_ids = set()
             trips = [trip for trip in sched.trips if trip.route_id == route.route_id]
@@ -190,19 +211,19 @@ class GTFSData:
 
                         if stop_id not in stop_coords[route.route_id]:
                             stop = sched.stops_by_id(stop_id)[0]
-                            
+
                             # Validar que la parada tiene coordenadas válidas
                             if stop.stop_lat is None or stop.stop_lon is None:
                                 continue  # Saltar paradas sin coordenadas
-                            
+
                             try:
                                 lat = float(stop.stop_lat)
                                 lon = float(stop.stop_lon)
-                                
+
                                 # Validar rango geográfico
                                 if not (-90 <= lat <= 90 and -180 <= lon <= 180):
                                     continue
-                                    
+
                                 stop_coords[route.route_id][stop_id] = (lon, lat)
                             except (ValueError, TypeError):
                                 continue  # Saltar paradas con coordenadas inválidas
@@ -946,8 +967,7 @@ class GTFSData:
         half_delta_lat = radians(lat2 - lat1) * 0.5
         half_delta_lon = radians(lon2 - lon1) * 0.5
 
-        a = (sin(half_delta_lat) ** 2
-             + cos(lat1_rad) * cos(lat2_rad) * sin(half_delta_lon) ** 2)
+        a = sin(half_delta_lat) ** 2 + cos(lat1_rad) * cos(lat2_rad) * sin(half_delta_lon) ** 2
         return _EARTH_RADIUS_KM * 2.0 * asin(sqrt(a))
 
     def walking_travel_time(self, stop_coords, location_coords, speed):
@@ -965,10 +985,10 @@ class GTFSData:
         # Extract lat/lon from tuples (order: lat, lon)
         stop_lat, stop_lon = stop_coords
         location_lat, location_lon = location_coords
-        
+
         # Call haversine with correct parameter order: lon1, lat1, lon2, lat2
         distance = self.haversine(stop_lon, stop_lat, location_lon, location_lat)
-        
+
         time = round((distance / speed) * 3600, 2)
         return time
 
@@ -989,29 +1009,29 @@ class GTFSData:
             return []
 
         lat, lon = location_coords
-        
+
         # Aproximación: 1 grado latitud ~= 111 km
         # Usamos un margen ligeramente mayor en grados para asegurar que incluimos todos los puntos
         margin_deg = (margin_km / 111.0) * 1.2
-        
+
         # Buscar índices de puntos candidatos en el árbol KD
         # query_ball_point usa distancia Euclidiana, que es una buena aproximación local
         indices = self._spatial_tree.query_ball_point([lat, lon], r=margin_deg)
-        
+
         nearby_stops = []
         for idx in indices:
             stop_id = self._stop_ids_list[idx]
             s_lat, s_lon = self._stop_coords_array[idx]
-            
+
             # Calcular distancia exacta con Haversine
             distance = self.haversine(lon, lat, s_lon, s_lat)
-            
+
             if distance <= margin_km:
                 nearby_stops.append((stop_id, distance))
-        
+
         # Sort by distance (closest first)
         nearby_stops.sort(key=lambda x: x[1])
-        
+
         # Return at most max_stops
         return nearby_stops[:max_stops]
 
@@ -1038,8 +1058,12 @@ class GTFSData:
                     resolved = (stop_obj.stop_lon, stop_obj.stop_lat)
                     self._stop_coords[stop_id] = resolved
                     return resolved
-        except Exception:
-            pass
+        except (KeyError, AttributeError, ValueError) as e:
+            logging.getLogger(__name__).warning(
+                "get_stop_coords fallback failed for %s: %s",
+                stop_id,
+                e,
+            )
 
         return None
 
@@ -1076,53 +1100,56 @@ class GTFSData:
         # así que las listas por ruta también heredan el orden correcto.
         return routes_nearby
 
-    def compute_all_transfers(self, max_distance_km: float = 0.5, 
-                              max_waiting_minutes: int = 15,
-                              walking_speed_kmh: float = 5.0):
+    def compute_all_transfers(
+        self,
+        max_distance_km: float = 0.5,
+        max_waiting_minutes: int = 15,
+        walking_speed_kmh: float = 5.0,
+    ):
         """
         Calcula todas las transferencias posibles entre rutas.
-        
+
         Args:
             max_distance_km: Distancia máxima de caminata para transbordo (default: 0.5 km)
             max_waiting_minutes: Tiempo máximo de espera (default: 15 minutos)
             walking_speed_kmh: Velocidad de caminata (default: 5 km/h)
-            
+
         Returns:
             TransferManager: Objeto con todas las transferencias calculadas
         """
         from .TransferConnection import TransferConnection, TransferManager
-        
+
         transfer_manager = TransferManager()
         transfer_count = 0
-        
+
         print(f"Calculando transferencias para {len(self.route_stops)} rutas...")
-        
+
         # Para cada ruta
         for from_route_id, stops_dict in self.route_stops.items():
             # Para cada parada de la ruta
             for from_stop_id in stops_dict.keys():
                 # Encontrar rutas cercanas
                 nearby_routes = self.find_nearby_routes(from_stop_id, margin_km=max_distance_km)
-                
+
                 # Crear transferencias
                 for to_route_id, nearby_stops in nearby_routes.items():
                     # Evitar transferencias a la misma ruta
                     if from_route_id == to_route_id:
                         continue
-                    
+
                     # Para cada parada cercana de la ruta destino
                     for to_stop_id, distance in nearby_stops[:3]:  # Top 3 más cercanas
                         # Calcular tiempo de caminata
                         walking_time = (distance / walking_speed_kmh) * 3600  # segundos
-                        
+
                         # Determinar tipo de transbordo
                         if from_stop_id == to_stop_id:
-                            transfer_type = 'same_stop'
+                            transfer_type = "same_stop"
                         elif distance < 0.05:  # Menos de 50 metros
-                            transfer_type = 'nearby'
+                            transfer_type = "nearby"
                         else:
-                            transfer_type = 'walking'
-                        
+                            transfer_type = "walking"
+
                         # Crear transferencia
                         transfer = TransferConnection(
                             from_route_id=from_route_id,
@@ -1133,15 +1160,15 @@ class GTFSData:
                             walking_time_seconds=walking_time,
                             min_transfer_time=max(120, int(walking_time)),  # Mínimo 2 minutos
                             max_waiting_time=max_waiting_minutes * 60,
-                            transfer_type=transfer_type
+                            transfer_type=transfer_type,
                         )
-                        
+
                         transfer_manager.add_transfer(transfer)
                         transfer_count += 1
-        
+
         # Almacenar en la instancia
         self.transfer_manager = transfer_manager
-        
+
         return transfer_manager
 
     def get_or_compute_transfers(
@@ -1162,8 +1189,9 @@ class GTFSData:
         Returns:
             TransferManager con todas las transferencias viables
         """
-        from .TransferConnection import TransferManager
         import os
+
+        from .TransferConnection import TransferManager
 
         if hasattr(self, "transfer_manager"):
             return self.transfer_manager
@@ -1194,18 +1222,18 @@ class GTFSData:
     def get_transfer_options(self, route_id: str, stop_id: str, viable_only: bool = True):
         """
         Obtiene opciones de transbordo desde una parada de una ruta.
-        
+
         Args:
             route_id: ID de la ruta actual
             stop_id: ID de la parada actual
             viable_only: Si True, solo retorna transferencias viables
-            
+
         Returns:
             list: Lista de TransferConnection disponibles
         """
-        if not hasattr(self, 'transfer_manager'):
+        if not hasattr(self, "transfer_manager"):
             return []
-        
+
         if viable_only:
             return self.transfer_manager.get_viable_transfers_from(route_id, stop_id)
         else:
@@ -1222,7 +1250,7 @@ class GTFSData:
         dict: A dictionary with the names of the stations.
         """
         subway_stops = {}
-        with open(stops_file, "r") as f:
+        with open(stops_file) as f:
             for line in f:
                 stop_id, _, stop_name, _, _, _, _ = line.strip().split(",")
                 if stop_id.isdigit():
