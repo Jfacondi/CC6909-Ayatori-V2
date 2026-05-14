@@ -1,0 +1,15 @@
+services:
+  ayatori:
+    build: .
+    image: ayatori-api:dev
+    container_name: ayatori-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Datos GTFS y cache de transferencias persisten fuera de la imagen.
+      - ./ayatori/data:/app/ayatori/data
+    environment:
+      AYATORI_GTFS_PATH: ayatori/data/GTFS/2023-09-16/GTFS-V100-PO20230916.zip
+      AYATORI_TRANSFERS_CACHE: ayatori/data/cache/transfers.json
+      AYATORI_TRANSFERS_MAX_DIST_KM: "0.5"
+    restart: unless-stopped
