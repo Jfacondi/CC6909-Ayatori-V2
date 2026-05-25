@@ -7,19 +7,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Build deps that some wheels still need on slim images.
+# Build deps + libs nativas para el extra "geo" (pyrosm/geopandas/shapely/
+# pyproj/rtree). En python:3.11-slim casi todo viene en wheels, pero estas
+# libs cubren los fallbacks a build desde fuente y el runtime de pyrosm.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential gcc \
+ && apt-get install -y --no-install-recommends \
+      build-essential gcc \
+      libgdal-dev libgeos-dev libproj-dev libspatialindex-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps first for better layer caching.
-COPY requirements.txt setup.py ./
+COPY pyproject.toml README.md ./
 COPY ayatori ./ayatori
-RUN pip install -r requirements.txt \
- && pip install fastapi "uvicorn[standard]" \
- && pip install -e .
-
 COPY api ./api
+# "geo" habilita OSM + shapes sintéticas dentro del contenedor.
+RUN pip install -e ".[api,viz,geo]"
 
 EXPOSE 8000
 

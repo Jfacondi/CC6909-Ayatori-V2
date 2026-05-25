@@ -16,6 +16,7 @@ class OSMGraph:
         self._node_id_list: list = []
         self._coord_array: np.ndarray = np.empty((0, 2))
         self._kdtree: cKDTree = None
+        self._sp_cache: dict = {}  # (src_idx, tgt_idx) -> (km, polyline) | None
         self.graph = self.create_osm_graph(OSM_PATH)
         self._build_spatial_index()
 
@@ -54,6 +55,7 @@ class OSMGraph:
         instance._node_id_list = []
         instance._coord_array = np.empty((0, 2))
         instance._kdtree = None
+        instance._sp_cache = {}
 
         osm = pyrosm.OSM(pbf_path)
         nodes, edges = osm.get_network(network_type=network_type, nodes=True)
@@ -159,6 +161,70 @@ class OSMGraph:
             return None
         _, idx = self._kdtree.query([latitude, longitude])
         return self._node_id_list[idx]
+
+    def shortest_path(self, from_latlon, to_latlon):
+        """Ruta peatonal más corta entre dos coordenadas por la red OSM.
+
+        Args:
+            from_latlon: ``(lat, lon)`` de origen.
+            to_latlon: ``(lat, lon)`` de destino.
+
+        Returns:
+            ``(distancia_km, polyline)`` donde ``polyline`` es ``[[lat, lon], ...]``,
+            o ``None`` si no hay ruta (componentes desconectadas, sin índice).
+            El llamador cae a Haversine cuando recibe ``None``.
+        """
+        if self._kdtree is None:
+            return None
+        fid = self.find_nearest_node(from_latlon[0], from_latlon[1])
+        tid = self.find_nearest_node(to_latlon[0], to_latlon[1])
+        if fid is None or tid is None:
+            return None
+        src = self._node_id_to_idx.get(fid)
+        tgt = self._node_id_to_idx.get(tid)
+        if src is None or tgt is None:
+            return None
+
+        if src == tgt:
+            d = self.graph[src]
+            return (0.0, [[d["lat"], d["lon"]], [d["lat"], d["lon"]]])
+
+        ck = (src, tgt)
+        if ck in self._sp_cache:
+            return self._sp_cache[ck]
+
+        try:
+            paths = rx.dijkstra_shortest_paths(
+                self.graph,
+                src,
+                target=tgt,
+                weight_fn=lambda e: float(e["weight"]),
+            )
+        except Exception:
+            self._sp_cache[ck] = None
+            return None
+
+        node_path = paths.get(tgt)
+        if not node_path:
+            self._sp_cache[ck] = None
+            return None
+
+        meters = 0.0
+        poly: list = []
+        prev = None
+        for idx in node_path:
+            d = self.graph[idx]
+            poly.append([d["lat"], d["lon"]])
+            if prev is not None:
+                ed = self.graph.get_edge_data(prev, idx)
+                if ed:
+                    meters += float(ed["weight"])
+            prev = idx
+
+        result = (meters / 1000.0, poly)
+        if len(self._sp_cache) < 200000:  # cota de memoria
+            self._sp_cache[ck] = result
+        return result
 
     def address_locator(self, address, max_retries: int = 15, retry_delay: float = 5.0):
         """Geocodifica una dirección y devuelve el nodo OSM más cercano.

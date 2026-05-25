@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class TransferConnection:
     """
     Representa una conexión de transbordo entre dos paradas de diferentes rutas.
@@ -37,6 +37,8 @@ class TransferConnection:
     min_transfer_time: int = 120  # 2 minutos por defecto
     max_waiting_time: int = 900  # 15 minutos por defecto
     transfer_type: str = "nearby"
+    # Polyline peatonal real (OSM) [[lat, lon], ...]; None = sin geometría.
+    walking_path: list | None = None
 
     def is_viable(self) -> bool:
         """
@@ -91,6 +93,7 @@ class TransferConnection:
             "min_transfer_time": self.min_transfer_time,
             "max_waiting_time": self.max_waiting_time,
             "transfer_type": self.transfer_type,
+            "walking_path": self.walking_path,
             "is_viable": self.is_viable(),
         }
 

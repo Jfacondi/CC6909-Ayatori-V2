@@ -14,6 +14,15 @@ from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any
 
+# Carga variables desde .env antes de leerlas con os.environ.get. Las que ya
+# estén en el entorno (shell, Docker) tienen prioridad.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -30,6 +39,7 @@ from .schemas import (
     ComparePlanResponse,
     CompareVariantResponse,
     ConfigOverride,
+    GeocodeResult,
     HealthResponse,
     NearbyStop,
     PlanRequest,
@@ -51,6 +61,20 @@ DEFAULT_TRANSFERS_CACHE = os.environ.get(
 )
 TRANSFERS_MAX_DISTANCE_KM = float(os.environ.get("AYATORI_TRANSFERS_MAX_DIST_KM", "0.5"))
 
+# Shapes sintéticas: cuando el GTFS no trae shape para una ruta de bus/tram,
+# se traza pasando por la red vial OSM. Cacheado en disco. Sólo se activa si
+# hay OSM cargado (sin OSM, la API cae al fallback "polyline por paradas").
+DEFAULT_SYNTHETIC_SHAPES_CACHE = os.environ.get(
+    "AYATORI_SYNTHETIC_SHAPES_CACHE",
+    "ayatori/data/cache/synthetic_shapes_osm.json",
+)
+USE_SYNTHETIC_SHAPES = os.environ.get("AYATORI_SYNTHETIC_SHAPES", "1") == "1"
+
+# Ruteo peatonal real con OSM. Opt-in: requiere el extra `geo` (pyrosm) y un
+# .pbf. Si falla la carga, se degrada a Haversine sin error.
+USE_OSM = os.environ.get("AYATORI_USE_OSM", "0") == "1"
+DEFAULT_OSM_PBF = os.environ.get("AYATORI_OSM_PBF", "ayatori/data/OSM/Santiago.osm.pbf")
+
 STATE: dict[str, Any] = {}
 
 
@@ -68,17 +92,59 @@ async def lifespan(app: FastAPI):
     gtfs = GTFSData(str(gtfs_path))
     logger.info("GTFS loaded: %d routes, %d stops", len(gtfs.route_stops), len(gtfs.stops))
 
-    cache_path = Path(DEFAULT_TRANSFERS_CACHE)
+    # ── Carga opcional del grafo peatonal OSM (degradación elegante) ──────────
+    osm = None
+    if USE_OSM:
+        pbf = Path(DEFAULT_OSM_PBF)
+        if not pbf.exists():
+            logger.warning("AYATORI_USE_OSM=1 pero no existe %s; usando Haversine", pbf)
+        else:
+            try:
+                import time as _t
+
+                from ayatori.models.OSMGraph import OSMGraph
+
+                t0 = _t.time()
+                logger.info("Loading OSM pedestrian graph from %s ...", pbf)
+                osm = OSMGraph.from_file(str(pbf))
+                logger.info("OSM graph loaded in %.1fs", _t.time() - t0)
+            except Exception as e:  # pyrosm ausente / pbf inválido / etc.
+                logger.warning("OSM no disponible (%s); usando Haversine", e)
+                osm = None
+
+    # Cache de transbordos separada por modo para no colisionar Haversine/OSM.
+    base_cache = Path(DEFAULT_TRANSFERS_CACHE)
+    if osm is not None:
+        cache_path = base_cache.with_name(base_cache.stem + "_osm" + base_cache.suffix)
+    else:
+        cache_path = base_cache
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Loading/computing transfer matrix (cache=%s)", cache_path)
     tm = gtfs.get_or_compute_transfers(
         cache_path=str(cache_path),
         max_distance_km=TRANSFERS_MAX_DISTANCE_KM,
+        osm_graph=osm,
     )
     logger.info("Transfers ready: %d entries", tm.count_transfers())
 
+    # ── Shapes sintéticas para rutas sin shape GTFS (requiere OSM) ──────────
+    if USE_SYNTHETIC_SHAPES and osm is not None:
+        synth_cache = Path(DEFAULT_SYNTHETIC_SHAPES_CACHE)
+        synth_cache.parent.mkdir(parents=True, exist_ok=True)
+        logger.info("Loading/computing synthetic shapes (cache=%s)", synth_cache)
+        gtfs.get_or_compute_synthetic_shapes(
+            cache_path=str(synth_cache), osm_graph=osm
+        )
+        logger.info("Synthetic shapes ready")
+    elif USE_SYNTHETIC_SHAPES:
+        logger.info(
+            "Synthetic shapes habilitadas pero OSM no está disponible; "
+            "se usará fallback 'polyline por paradas'."
+        )
+
     STATE["gtfs"] = gtfs
     STATE["tm"] = tm
+    STATE["osm"] = osm
     STATE["num_transfers"] = tm.count_transfers()
     yield
     STATE.clear()
@@ -109,13 +175,19 @@ def _config_from_override(override: ConfigOverride | None) -> CSAConfig:
     if override is None:
         return base
     overrides = override.model_dump(exclude_unset=True, exclude_none=True)
+    # CSAConfig.allowed_modes/excluded_modes son tuple; Pydantic entrega list.
+    for key in ("allowed_modes", "excluded_modes"):
+        if key in overrides and overrides[key] is not None:
+            overrides[key] = tuple(overrides[key])
     return replace(base, **overrides)
 
 
 def _run_plan(req_origin, req_destination, req_departure, profile, num_alternatives, csa_config):
     gtfs = STATE["gtfs"]
     tm = STATE["tm"]
-    csa = ConnectionScanAlgorithm(gtfs, transfer_manager=tm, config=csa_config)
+    csa = ConnectionScanAlgorithm(
+        gtfs, transfer_manager=tm, config=csa_config, osm_graph=STATE.get("osm")
+    )
     journeys = csa.find_journey(
         origin_coords=tuple(req_origin),
         destination_coords=tuple(req_destination),
@@ -123,7 +195,7 @@ def _run_plan(req_origin, req_destination, req_departure, profile, num_alternati
         num_alternatives=num_alternatives,
         profile=profile,
     )
-    return [journey_to_dto(j, gtfs.get_stop_coords) for j in journeys]
+    return [journey_to_dto(j, gtfs) for j in journeys]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -167,9 +239,34 @@ def config_schema():
         "max_destination_stops": {"min": 1, "max": 30, "step": 1},
         "fallback_step_minutes": {"min": 0.5, "max": 30.0, "step": 0.5},
     }
-    return {
-        f.name: {"default": defaults[f.name], **bounds.get(f.name, {})} for f in fields(CSAConfig())
+    from .schemas import KNOWN_MODES
+
+    mode_list_fields = {"allowed_modes", "excluded_modes"}
+    mode_map_fields = {
+        "mode_transfer_penalty_seconds",
+        "mode_preference_weight",
+        "mode_access_walk_km",
     }
+
+    out: dict = {}
+    for f in fields(CSAConfig()):
+        name = f.name
+        entry: dict = {"default": defaults[name]}
+        if name in bounds:
+            entry["kind"] = "number"
+            entry.update(bounds[name])
+        elif name in mode_list_fields:
+            entry["kind"] = "modes"
+            entry["options"] = list(KNOWN_MODES)
+        elif name in mode_map_fields:
+            entry["kind"] = "mode_map"
+            entry["options"] = list(KNOWN_MODES)
+        elif isinstance(defaults[name], bool):
+            entry["kind"] = "bool"
+        else:
+            entry["kind"] = "other"
+        out[name] = entry
+    return out
 
 
 @app.get("/stops/nearby", response_model=list[NearbyStop])
@@ -189,6 +286,65 @@ def stops_nearby(
             continue
         clon, clat = coords
         out.append(NearbyStop(stop_id=stop_id, distance_km=dist, lat=clat, lon=clon))
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Geocoding (proxy a Nominatim con cache en memoria)
+#
+# Política de Nominatim: User-Agent identificable, máximo 1 req/s,
+# preferir cache. Aquí cacheamos cada (q, limit, countrycodes) sin TTL
+# (las direcciones no se mueven). countrycodes=cl evita matches en otros
+# países dado que el feed GTFS solo cubre Santiago.
+# ──────────────────────────────────────────────────────────────────────
+
+_GEOCODE_USER_AGENT = "Ayatori/0.2.0 (FCFM memoria de titulo)"
+_GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
+_geocode_cache: dict[tuple[str, int, str], list[GeocodeResult]] = {}
+
+
+@app.get("/geocode", response_model=list[GeocodeResult])
+async def geocode(
+    q: str = Query(..., min_length=2, max_length=200),
+    limit: int = Query(5, ge=1, le=10),
+    countrycodes: str = Query("cl", min_length=2, max_length=20),
+):
+    import httpx
+
+    key = (q.strip().lower(), limit, countrycodes.lower())
+    cached = _geocode_cache.get(key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "q": q,
+        "format": "json",
+        "addressdetails": 0,
+        "limit": limit,
+        "countrycodes": countrycodes,
+    }
+    headers = {"User-Agent": _GEOCODE_USER_AGENT, "Accept-Language": "es"}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(_GEOCODE_URL, params=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=503, detail=f"Geocoder no disponible: {e!s}"
+        ) from e
+
+    out = [
+        GeocodeResult(
+            display_name=d["display_name"],
+            lat=float(d["lat"]),
+            lon=float(d["lon"]),
+            type=d.get("type"),
+            importance=d.get("importance"),
+        )
+        for d in data
+    ]
+    _geocode_cache[key] = out
     return out
 
 

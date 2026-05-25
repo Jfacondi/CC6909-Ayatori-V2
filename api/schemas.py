@@ -5,10 +5,23 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-OptimizationProfile = Literal["fastest", "fewer_transfers", "less_walking", "balanced"]
+OptimizationProfile = Literal[
+    "fastest", "fewer_transfers", "less_walking", "balanced", "prefer_rail"
+]
 LatLon = tuple[float, float]
+
+KNOWN_MODES = (
+    "bus",
+    "metro",
+    "rail",
+    "tram",
+    "ferry",
+    "cable",
+    "gondola",
+    "funicular",
+)
 
 
 class ConfigOverride(BaseModel):
@@ -32,6 +45,45 @@ class ConfigOverride(BaseModel):
     max_origin_stops: int | None = Field(None, ge=1, le=30)
     max_destination_stops: int | None = Field(None, ge=1, le=30)
     fallback_step_minutes: float | None = Field(None, ge=0.5, le=30.0)
+
+    # Consciente de modo
+    allowed_modes: list[str] | None = Field(
+        None, description="Si se setea, solo estos modos son abordables."
+    )
+    excluded_modes: list[str] | None = Field(
+        None, description="Modos nunca abordables."
+    )
+    mode_transfer_penalty_seconds: dict[str, int] | None = Field(
+        None, description="Sesgo de costo (s) por abordar un modo; negativo=preferir."
+    )
+    mode_preference_weight: dict[str, float] | None = Field(
+        None, description="Multiplicador del tiempo en vehículo por modo."
+    )
+    mode_access_walk_km: dict[str, float] | None = Field(
+        None, description="Budget de caminata de acceso/egreso por modo (km)."
+    )
+
+    @field_validator("allowed_modes", "excluded_modes")
+    @classmethod
+    def _check_mode_list(cls, v):
+        if v is not None:
+            bad = [m for m in v if m not in KNOWN_MODES]
+            if bad:
+                raise ValueError(f"modos inválidos: {bad}; válidos: {list(KNOWN_MODES)}")
+        return v
+
+    @field_validator(
+        "mode_transfer_penalty_seconds",
+        "mode_preference_weight",
+        "mode_access_walk_km",
+    )
+    @classmethod
+    def _check_mode_map(cls, v):
+        if v is not None:
+            bad = [m for m in v if m not in KNOWN_MODES]
+            if bad:
+                raise ValueError(f"modos inválidos: {bad}; válidos: {list(KNOWN_MODES)}")
+        return v
 
 
 class PlanRequest(BaseModel):
@@ -86,13 +138,26 @@ class SegmentDTO(BaseModel):
     to_stop: str | None = None
     departure_time: datetime | None = None
     arrival_time: datetime | None = None
+    # transit (consciente de modo)
+    mode: str | None = None
+    route_short_name: str | None = None
+    route_long_name: str | None = None
+    agency_name: str | None = None
+    route_color: str | None = None
+    from_stop_name: str | None = None
+    to_stop_name: str | None = None
     # transfer
     from_route: str | None = None
     to_route: str | None = None
     at_stop: str | None = None
+    at_stop_name: str | None = None
+    from_mode: str | None = None
+    to_mode: str | None = None
     # geometría enriquecida en el handler (no la produce CSA)
     from_coords: list[float] | None = None
     to_coords: list[float] | None = None
+    # polyline real del shape GTFS para tramos transit ([lat, lon], ...)
+    path: list[list[float]] | None = None
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -130,6 +195,14 @@ class NearbyStop(BaseModel):
     lon: float
 
 
+class GeocodeResult(BaseModel):
+    display_name: str
+    lat: float
+    lon: float
+    type: str | None = None
+    importance: float | None = None
+
+
 class HealthResponse(BaseModel):
     status: str
     gtfs_loaded: bool
@@ -143,14 +216,18 @@ class HealthResponse(BaseModel):
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _serialize_segment(seg: dict, stop_coords_fn) -> dict:
+def _serialize_segment(seg: dict, gtfs) -> dict:
     """Convierte un segment dict del CSA a uno serializable.
 
     - timedelta -> duration_seconds
     - datetime queda; Pydantic lo emite ISO 8601
     - enriquece con from_coords/to_coords mirando GTFSData cuando el segmento
       sólo trae stop_ids (útil para que el frontend dibuje sin más queries).
+    - para segmentos transit, inyecta ``path`` con el polyline real del shape.
     """
+    stop_coords_fn = gtfs.get_stop_coords
+    stop_name_fn = getattr(gtfs, "get_stop_name", lambda _sid: None)
+
     out: dict[str, Any] = {}
     for k, v in seg.items():
         if isinstance(v, timedelta):
@@ -164,24 +241,52 @@ def _serialize_segment(seg: dict, stop_coords_fn) -> dict:
     if seg_type == "transit":
         from_stop = seg.get("from_stop")
         to_stop = seg.get("to_stop")
+        route_id = seg.get("route_id")
         if from_stop:
             c = stop_coords_fn(from_stop)
             if c is not None:
                 lon, lat = c
                 out["from_coords"] = [lat, lon]
+            out["from_stop_name"] = stop_name_fn(from_stop)
         if to_stop:
             c = stop_coords_fn(to_stop)
             if c is not None:
                 lon, lat = c
                 out["to_coords"] = [lat, lon]
+            out["to_stop_name"] = stop_name_fn(to_stop)
+        if route_id and from_stop and to_stop:
+            path = gtfs.get_route_shape_segment(route_id, from_stop, to_stop)
+            # Fallback para evitar tramos en línea recta cuando el feed no trae
+            # shapes para esta ruta: dibujar pasando por las paradas intermedias.
+            # Solo aplica a modos que siguen la red vial (no metro, que va por
+            # túneles propios y donde la línea recta entre estaciones es
+            # razonable).
+            if not path and seg.get("mode") != "metro":
+                path = gtfs.get_route_stops_segment(route_id, from_stop, to_stop)
+            if path:
+                out["path"] = path
     elif seg_type == "transfer":
         at = seg.get("at_stop")
         if at:
+            out["at_stop_name"] = stop_name_fn(at)
+        # Footpath: transbordo caminando entre paradas distintas → resolver
+        # ambos extremos y nombres (si no, transbordo en la misma parada).
+        fs = seg.get("from_stop")
+        tgt = seg.get("to_stop")
+        if fs and tgt and fs != tgt:
+            cf = stop_coords_fn(fs)
+            ct = stop_coords_fn(tgt)
+            if cf is not None:
+                out["from_coords"] = [cf[1], cf[0]]
+            if ct is not None:
+                out["to_coords"] = [ct[1], ct[0]]
+            out["from_stop_name"] = stop_name_fn(fs)
+            out["to_stop_name"] = stop_name_fn(tgt)
+        elif at:
             c = stop_coords_fn(at)
             if c is not None:
-                lon, lat = c
-                out["from_coords"] = [lat, lon]
-                out["to_coords"] = [lat, lon]
+                out["from_coords"] = [c[1], c[0]]
+                out["to_coords"] = [c[1], c[0]]
     elif seg_type == "walk":
         # Si vino con stop_id en from/to (no "origin"/"destination"), resolverlo
         frm = seg.get("from")
@@ -200,15 +305,12 @@ def _serialize_segment(seg: dict, stop_coords_fn) -> dict:
     return out
 
 
-def journey_to_dto(journey, stop_coords_fn) -> JourneyDTO:
+def journey_to_dto(journey, gtfs) -> JourneyDTO:
     return JourneyDTO(
         total_duration_seconds=journey.total_duration.total_seconds(),
         departure_time=journey.departure_time,
         arrival_time=journey.arrival_time,
         number_of_transfers=journey.number_of_transfers,
         total_walking_distance_km=journey.total_walking_distance,
-        segments=[
-            SegmentDTO.model_validate(_serialize_segment(s, stop_coords_fn))
-            for s in journey.segments
-        ],
+        segments=[SegmentDTO.model_validate(_serialize_segment(s, gtfs)) for s in journey.segments],
     )

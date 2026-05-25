@@ -175,6 +175,87 @@ class TestDataDirectory:
         assert gtfs_dir.exists() or True, "GTFS dir opcional (datos pueden no estar)"
 
 
+class TestConnectionScanAlgorithm:
+    """Pruebas para el módulo ConnectionScanAlgorithm (contrato de la propuesta §6.6.1)."""
+
+    def test_connection_scan_algorithm_class(self):
+        """Verificar que la clase CSA existe y expone su API pública."""
+        from ayatori.models import ConnectionScanAlgorithm
+        import inspect
+
+        assert inspect.isclass(ConnectionScanAlgorithm)
+        members = dict(inspect.getmembers(ConnectionScanAlgorithm, predicate=inspect.isfunction))
+        for method in ("find_journey", "_connection_scan_multi_target", "_pareto_filter"):
+            assert method in members, f"ConnectionScanAlgorithm falta método: {method}"
+
+
+class TestTransferConnection:
+    """Pruebas para TransferConnection / TransferManager (contrato de la propuesta §6.6.1)."""
+
+    def test_transfer_connection_class(self):
+        """Verificar campos, slots=True y is_viable() de TransferConnection."""
+        from ayatori.models import TransferConnection
+
+        t = TransferConnection(
+            from_route_id="R1",
+            to_route_id="R2",
+            from_stop_id="S1",
+            to_stop_id="S2",
+            walking_distance_km=0.1,
+            walking_time_seconds=120,
+        )
+        # slots=True añadido en Bloque 1: la instancia no debe tener __dict__
+        assert not hasattr(t, "__dict__"), "TransferConnection debe usar slots=True"
+        assert t.is_viable() is True
+        # Un transbordo de 1 km no es caminable → no viable
+        t_lejos = TransferConnection("R1", "R2", "S1", "S2", 1.0, 800)
+        assert t_lejos.is_viable() is False
+
+    def test_transfer_methods(self):
+        """Verificar que TransferManager expone su API de registro y persistencia."""
+        from ayatori.models import TransferConnection, TransferManager
+        import inspect
+
+        # load() es @classmethod → usar callable(getattr) en vez de inspect.isfunction
+        for method in ("add_transfer", "save", "load", "get_transfers_from", "count_transfers"):
+            assert callable(getattr(TransferManager, method, None)), (
+                f"TransferManager falta método: {method}"
+            )
+
+        # Comportamiento mínimo: agregar + deduplicar
+        mgr = TransferManager()
+        tc = TransferConnection("R1", "R2", "S1", "S2", 0.1, 120)
+        mgr.add_transfer(tc)
+        mgr.add_transfer(tc)  # duplicado, debe ignorarse
+        assert mgr.count_transfers() == 1
+        assert mgr.get_transfers_from("R1", "S1") == [tc]
+
+
+class TestTestData:
+    """Pruebas de disponibilidad de datos de prueba (contrato de la propuesta §6.6.1)."""
+
+    def test_gtfs_test_data(self):
+        """El feed GTFS de prueba debe existir o ser descargable (no obligatorio en CI)."""
+        from ayatori.utils.paths import data_dir
+
+        candidates = [
+            data_dir() / "GTFS" / "test-data" / "santiago-gtfs.zip",
+            data_dir() / "GTFS" / "2023-09-16" / "GTFS-V100-PO20230916.zip",
+        ]
+        if not any(p.exists() for p in candidates):
+            pytest.skip("GTFS de prueba no presente (descargar con ayatori-fetch-data)")
+        assert any(p.exists() for p in candidates)
+
+    def test_osm_test_data(self):
+        """El .pbf de OSM debe existir o ser descargable (no obligatorio en CI)."""
+        from ayatori.utils.paths import data_dir
+
+        pbf = data_dir() / "OSM" / "Santiago.osm.pbf"
+        if not pbf.exists():
+            pytest.skip("OSM .pbf no presente (descargar con ayatori-fetch-data)")
+        assert pbf.exists()
+
+
 def run_basic_tests():
     """Ejecutar pruebas sin pytest (para desarrollo rápido)."""
     print("\n" + "=" * 70)
@@ -188,7 +269,16 @@ def run_basic_tests():
     }
     
     # Importar todos los tests
-    test_classes = [TestImports, TestGTFSData, TestOSMGraph, TestRustworkxUsage, TestDataDirectory]
+    test_classes = [
+        TestImports,
+        TestGTFSData,
+        TestOSMGraph,
+        TestRustworkxUsage,
+        TestDataDirectory,
+        TestConnectionScanAlgorithm,
+        TestTransferConnection,
+        TestTestData,
+    ]
     
     for test_class in test_classes:
         print(f"\n{test_class.__name__}")

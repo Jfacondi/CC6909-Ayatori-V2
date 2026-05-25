@@ -15,16 +15,41 @@ Implementación alineada con prácticas estándar de planificadores de transport
 """
 
 import heapq
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from math import asin, cos, radians, sin, sqrt
 from typing import Literal
 
 _EARTH_RADIUS_KM = 6371.0
+_SECS_DAY = 24 * 3600
 
-OptimizationProfile = Literal["fastest", "fewer_transfers", "less_walking", "balanced"]
+OptimizationProfile = Literal[
+    "fastest", "fewer_transfers", "less_walking", "balanced", "prefer_rail"
+]
+
+# Modos GTFS canónicos reconocidos (ver GTFSData._ROUTE_TYPE_TO_MODE).
+KNOWN_MODES = (
+    "bus",
+    "metro",
+    "rail",
+    "tram",
+    "ferry",
+    "cable",
+    "gondola",
+    "funicular",
+)
+
+# Sesgo por defecto de "prefer_rail": penaliza (en costo, no en tiempo) abordar
+# bus y favorece metro/tren. Solo afecta el ranking final, no la búsqueda.
+_PREFER_RAIL_TRANSFER_PENALTY = {
+    "bus": 240,
+    "metro": -180,
+    "rail": -240,
+    "tram": -60,
+}
 
 
 @dataclass
@@ -56,6 +81,31 @@ class CSAConfig:
     max_origin_stops: int = 8
     max_destination_stops: int = 8
     fallback_step_minutes: float = 2.0  # estimación cuando no hay horario
+
+    # ── Modo de transporte (consciente de modo) ──────────────────────────────
+    # Todos default None/() → sin sesgo, conducta idéntica a la histórica.
+    allowed_modes: tuple[str, ...] | None = None  # si se setea, solo estos abordables
+    excluded_modes: tuple[str, ...] = ()  # modos nunca abordables
+    # Sesgo (segundos) sumado al costo generalizado por cada abordaje de ese
+    # modo. Negativo = preferir. NO afecta el eje de tiempo de Dijkstra.
+    mode_transfer_penalty_seconds: dict | None = None
+    # Multiplicador del tiempo en vehículo por modo (solo costo "balanced").
+    mode_preference_weight: dict | None = None
+    # Budget de caminata de acceso/egreso por modo (km). Solo se usa cuando hay
+    # filtro de modo activo: amplía la búsqueda de paradas candidatas para
+    # alcanzar estaciones de metro/tren (más dispersas que las de bus). El tope
+    # global ``max_total_walking_km`` sigue aplicando. None = sin override.
+    mode_access_walk_km: dict | None = None
+
+    # Ruteo peatonal real (OSM). Solo efectivo si se pasa un OSMGraph al
+    # constructor; si no, o si shortest_path falla, cae a Haversine.
+    use_osm_walking: bool = True
+
+    # Calendario: respetar calendar.txt/calendar_dates.txt según la fecha de
+    # salida. Si no hay calendario o queda vacío, se cae al pool de horarios
+    # sin filtrar (comportamiento histórico) — nunca devuelve "0 viajes" por
+    # esto. Poner en False fuerza el comportamiento antiguo (debug/benchmark).
+    respect_calendar: bool = True
 
 
 @dataclass(slots=True)
@@ -108,6 +158,7 @@ class ConnectionScanAlgorithm:
         gtfs_data,
         transfer_manager=None,
         config: CSAConfig | None = None,
+        osm_graph=None,
         # — compatibilidad hacia atrás —
         max_walking_distance_km: float | None = None,
         walking_speed_kmh: float | None = None,
@@ -115,6 +166,7 @@ class ConnectionScanAlgorithm:
     ):
         self.gtfs = gtfs_data
         self.transfer_manager = transfer_manager
+        self.osm = osm_graph
         self.config = config or CSAConfig()
 
         # Si llegan kwargs legacy, sobreescriben el default del config.
@@ -130,6 +182,13 @@ class ConnectionScanAlgorithm:
         self.max_walking_km = self.config.max_walking_to_stop_km  # compat externo
         self.max_transfers = self.config.max_transfers
 
+        # Cache route_id → modo (resuelto vía GTFSData.get_route_mode)
+        self._route_mode_cache: dict = {}
+
+        # Cache (from_route, stop_id, to_route) → viabilidad del transbordo.
+        # Independiente del tiempo/origen → se reusa entre corridas y llamadas.
+        self._transfer_viable_cache: dict[tuple[str, str, str], bool] = {}
+
         # Índice stop→rutas: usa el de GTFSData si ya está construido; lo reconstruye si no
         self._stop_to_routes: dict = getattr(gtfs_data, "_stop_to_routes", None)
         if self._stop_to_routes is None:
@@ -137,6 +196,18 @@ class ConnectionScanAlgorithm:
             for route_id, stops_dict in gtfs_data.route_stops.items():
                 for sid in stops_dict:
                     self._stop_to_routes[sid].append(route_id)
+
+        # Si hay filtros de modo activos, pre-filtrar stop→rutas una sola vez
+        # para evitar reevaluar _mode_allowed en el hot path de Dijkstra.
+        # Mutar config.allowed_modes/excluded_modes tras construir el planner
+        # no surte efecto: reconstruir el planner si cambian.
+        if self.config.allowed_modes is not None or self.config.excluded_modes:
+            self._stop_to_routes_filtered: dict = {
+                sid: [r for r in routes if self._mode_allowed(r)]
+                for sid, routes in self._stop_to_routes.items()
+            }
+        else:
+            self._stop_to_routes_filtered = self._stop_to_routes
 
     # ────────────────────────────────────────────────────────────────────────
     # API pública
@@ -170,6 +241,14 @@ class ConnectionScanAlgorithm:
 
         cfg = self.config
 
+        # ── Servicios activos en la fecha de salida (calendar.txt + excepciones)
+        active_services: frozenset = frozenset()
+        if cfg.respect_calendar and hasattr(self.gtfs, "active_services_on"):
+            active_services = self.gtfs.active_services_on(departure_time.date())
+        # Cache local (merge perezoso por (route_id, stop_id)) reutilizado en
+        # toda la corrida multi-origen para no re-fusionar listas de servicios.
+        active_times_cache: dict = {}
+
         # ── Caminata directa: si destino está al alcance peatonal, sugerirlo
         direct_dist = self._haversine(
             origin_coords[1],
@@ -193,15 +272,11 @@ class ConnectionScanAlgorithm:
                 return direct_walks
 
         # ── Paradas candidatas en acceso y egreso (budgets de caminata)
-        origin_stops = self.gtfs.get_nearby_stops(
-            origin_coords,
-            margin_km=cfg.max_walking_to_stop_km,
-            max_stops=cfg.max_origin_stops,
+        origin_stops = self._candidate_stops(
+            origin_coords, cfg.max_walking_to_stop_km, cfg.max_origin_stops
         )
-        destination_stops = self.gtfs.get_nearby_stops(
-            destination_coords,
-            margin_km=cfg.max_walking_to_stop_km,
-            max_stops=cfg.max_destination_stops,
+        destination_stops = self._candidate_stops(
+            destination_coords, cfg.max_walking_to_stop_km, cfg.max_destination_stops
         )
 
         if not origin_stops or not destination_stops:
@@ -224,6 +299,8 @@ class ConnectionScanAlgorithm:
                 destination_coords=destination_coords,
                 origin_walk_dist=origin_dist,
                 actual_departure=departure_time,
+                active_services=active_services,
+                active_times_cache=active_times_cache,
             )
             all_journeys.extend(journeys)
 
@@ -232,9 +309,15 @@ class ConnectionScanAlgorithm:
         if not all_journeys:
             return []
 
-        # ── Filtrar: budgets totales, duplicados de secuencia de rutas
+        # ── Filtrar: budgets totales, tope de transbordos, duplicados
+        # El grafo Dijkstra optimiza llegada (in_connection indexado por parada),
+        # así que el camino mínimo en tiempo puede encadenar más cambios de ruta
+        # que max_transfers. Se descartan aquí para nunca exceder lo pedido.
         all_journeys = [
-            j for j in all_journeys if j.total_walking_distance <= cfg.max_total_walking_km
+            j
+            for j in all_journeys
+            if j.total_walking_distance <= cfg.max_total_walking_km
+            and j.number_of_transfers <= cfg.max_transfers
         ]
         if not all_journeys:
             return direct_walks  # fallback razonable
@@ -265,24 +348,43 @@ class ConnectionScanAlgorithm:
         destination_coords: tuple[float, float],
         origin_walk_dist: float,
         actual_departure: datetime,
+        active_services: frozenset = frozenset(),
+        active_times_cache: dict | None = None,
     ) -> list[Journey]:
         """Una corrida de Dijkstra desde ``origin_stop`` que alcanza todos los
         destinos candidatos en ``destination_walk_dist``.
 
-        Cada vez que un destino se "asienta" (settled) por primera vez, se
-        reconstruye su viaje. La búsqueda termina cuando todos los destinos
-        están asentados o cuando se rebasa el horizonte temporal.
+        El estado del scan trackea el ``trip_id`` activo (no sólo la ruta), por
+        lo que:
+        - Para abordar una ruta en una parada se exige que exista un trip cuyo
+          horario en esa parada sea ≥ a la hora actual. Sin esto, el algoritmo
+          asumía que se podía tomar cualquier bus cuyo horario en la PRÓXIMA
+          parada fuera futuro — incluso si ya había pasado por la actual.
+        - Las continuaciones (siguiente parada dentro del mismo bus) siguen el
+          sequence real del trip, no la "primera llegada disponible" en la
+          parada siguiente. Esto evita Frankensteins de varios trips.
+        - ``dep_time`` y ``arr_time`` guardados en ``in_connection`` son los
+          horarios reales del trip — la duración del segmento ya no incluye el
+          tiempo de espera del bus en el paradero.
         """
         cfg = self.config
         dest_set: set[str] = set(destination_walk_dist.keys())
         if not dest_set:
             return []
+        if active_times_cache is None:
+            active_times_cache = {}
 
         earliest_arrival: dict[str, datetime] = {origin_stop: start_time}
         in_connection: dict[str, tuple[str, str, datetime, datetime]] = {}
+        # Metadata de transbordos caminando (footpaths): clave = to_stop,
+        # valor = TransferConnection usado para reconstruir el segmento a pie.
+        walk_meta: dict[str, object] = {}
 
-        # (arrival_time, stop_id, current_route, num_transfers)
-        queue: list[tuple[datetime, str, str | None, int]] = [(start_time, origin_stop, None, 0)]
+        # (arrival_time, counter, stop_id, route_id|None, trip_id|None, num_transfers)
+        # counter rompe empates determinísticamente y evita que heapq compare
+        # None < str cuando dos llegadas coinciden al microsegundo.
+        counter = 0
+        queue: list[tuple] = [(start_time, counter, origin_stop, None, None, 0)]
 
         settled_state: set[tuple[str, str | None]] = set()
         visited_route_at_stop: set[tuple[str, str]] = set()
@@ -294,7 +396,14 @@ class ConnectionScanAlgorithm:
         )
 
         while queue:
-            arrival_time, current_stop, current_route, num_transfers = heapq.heappop(queue)
+            (
+                arrival_time,
+                _ctr,
+                current_stop,
+                current_route,
+                current_trip,
+                num_transfers,
+            ) = heapq.heappop(queue)
 
             if arrival_time > time_horizon:
                 break  # cola está ordenada por tiempo: más allá nada importa
@@ -317,6 +426,7 @@ class ConnectionScanAlgorithm:
                     origin_walk_dist=origin_walk_dist,
                     dest_walk_dist=destination_walk_dist[current_stop],
                     actual_departure=actual_departure,
+                    walk_meta=walk_meta,
                 )
                 if journey is not None:
                     reached[current_stop] = journey
@@ -328,40 +438,145 @@ class ConnectionScanAlgorithm:
             if num_transfers > cfg.max_transfers:
                 continue
 
+            # ── Continuación: si vengo arriba de un trip, seguir al próximo stop
+            # del MISMO bus. No es transbordo y no requiere abordaje.
+            if current_trip is not None:
+                adv = self._next_stop_on_trip(current_trip, current_stop, arrival_time)
+                if adv is not None:
+                    next_stop, next_arr_dt = adv
+                    if (
+                        next_arr_dt >= arrival_time
+                        and next_arr_dt <= time_horizon
+                        and (
+                            next_stop not in earliest_arrival
+                            or next_arr_dt < earliest_arrival[next_stop]
+                        )
+                    ):
+                        earliest_arrival[next_stop] = next_arr_dt
+                        in_connection[next_stop] = (
+                            current_stop,
+                            current_route,
+                            arrival_time,  # dep_time = hora real del trip en current_stop
+                            next_arr_dt,
+                        )
+                        counter += 1
+                        heapq.heappush(
+                            queue,
+                            (
+                                next_arr_dt,
+                                counter,
+                                next_stop,
+                                current_route,
+                                current_trip,
+                                num_transfers,
+                            ),
+                        )
+
+            # ── Abordaje de otra ruta (con o sin transbordo según si vengo en bus)
             for route_id in self._get_routes_at_stop(current_stop):
+                # Si ya estoy en esta ruta, la continuación de arriba se encarga.
+                if current_trip is not None and route_id == current_route:
+                    continue
+
                 pair = (current_stop, route_id)
                 if pair in visited_route_at_stop:
                     continue
                 visited_route_at_stop.add(pair)
 
-                needs_transfer = current_route is not None and current_route != route_id
+                # _mode_allowed ya aplicado a nivel de _stop_to_routes_filtered.
+
+                # "needs_transfer" = vengo arriba de un bus → cambiar a otro es transbordo.
+                # Si current_trip es None vengo a pie (origen o footpath) → no es transbordo.
+                needs_transfer = current_trip is not None
                 if needs_transfer:
+                    if num_transfers + 1 > cfg.max_transfers:
+                        continue
                     if not self._is_transfer_viable(current_route, current_stop, route_id):
                         continue
-                    dep_time = arrival_time + transfer_step
+                    board_after = arrival_time + transfer_step
                 else:
-                    dep_time = arrival_time
+                    board_after = arrival_time
 
-                next_stops = self._get_next_stops_on_route(route_id, current_stop, dep_time)
-                if not next_stops:
+                boarding = self._next_boarding(
+                    route_id,
+                    current_stop,
+                    board_after,
+                    active_services,
+                    active_times_cache,
+                )
+                if boarding is None:
+                    continue
+                board_dt, trip_id = boarding
+
+                adv = self._next_stop_on_trip(trip_id, current_stop, board_dt)
+                if adv is None:
+                    continue  # current_stop es la última del trip — no se puede avanzar
+                next_stop, next_arr_dt = adv
+                if next_arr_dt > time_horizon:
                     continue
 
                 new_transfers = num_transfers + (1 if needs_transfer else 0)
-                for next_stop, next_arrival_time in next_stops:
-                    if (
-                        next_stop not in earliest_arrival
-                        or next_arrival_time < earliest_arrival[next_stop]
-                    ):
-                        earliest_arrival[next_stop] = next_arrival_time
-                        in_connection[next_stop] = (
-                            current_stop,
+                if (
+                    next_stop not in earliest_arrival
+                    or next_arr_dt < earliest_arrival[next_stop]
+                ):
+                    earliest_arrival[next_stop] = next_arr_dt
+                    in_connection[next_stop] = (
+                        current_stop,
+                        route_id,
+                        board_dt,  # dep_time = hora real de boarding (no tu llegada al paradero)
+                        next_arr_dt,
+                    )
+                    counter += 1
+                    heapq.heappush(
+                        queue,
+                        (
+                            next_arr_dt,
+                            counter,
+                            next_stop,
                             route_id,
-                            dep_time,
-                            next_arrival_time,
+                            trip_id,
+                            new_transfers,
+                        ),
+                    )
+
+            # ── Footpath: caminar a una parada cercana distinta. ES el transbordo,
+            # por eso se empuja con current_trip=None (la próxima subida no recuenta).
+            if (
+                current_trip is not None
+                and self.transfer_manager is not None
+                and num_transfers + 1 <= cfg.max_transfers
+            ):
+                for tr in self.transfer_manager.get_transfers_from(
+                    current_route, current_stop
+                ):
+                    to_stop = tr.to_stop_id
+                    if (
+                        to_stop == current_stop
+                        or not tr.is_viable()
+                        or tr.walking_distance_km > cfg.max_walking_transfer_km
+                    ):
+                        continue
+                    walk_secs = tr.walking_time_seconds + cfg.transfer_buffer_seconds
+                    walk_arr = arrival_time + timedelta(seconds=walk_secs)
+                    if walk_arr > time_horizon:
+                        continue
+                    if (
+                        to_stop not in earliest_arrival
+                        or walk_arr < earliest_arrival[to_stop]
+                    ):
+                        earliest_arrival[to_stop] = walk_arr
+                        in_connection[to_stop] = (
+                            current_stop,
+                            "__walk__",
+                            arrival_time,
+                            walk_arr,
                         )
+                        walk_meta[to_stop] = tr
+                        counter += 1
                         heapq.heappush(
                             queue,
-                            (next_arrival_time, next_stop, route_id, new_transfers),
+                            (walk_arr, counter, to_stop, None, None, num_transfers + 1),
                         )
 
         return list(reached.values())
@@ -371,67 +586,269 @@ class ConnectionScanAlgorithm:
     # ────────────────────────────────────────────────────────────────────────
 
     def _get_routes_at_stop(self, stop_id: str) -> list[str]:
-        return self._stop_to_routes.get(stop_id, [])
+        # Devuelve la lista pre-filtrada por modo (idéntica al raw si no hay filtros).
+        return self._stop_to_routes_filtered.get(stop_id, [])
+
+    def _mode_of(self, route_id: str) -> str:
+        """Modo de una ruta (cacheado). ``bus`` si GTFSData no lo expone."""
+        mode = self._route_mode_cache.get(route_id)
+        if mode is None:
+            getter = getattr(self.gtfs, "get_route_mode", None)
+            mode = getter(route_id) if getter else "bus"
+            self._route_mode_cache[route_id] = mode
+        return mode
+
+    def _stop_serves_allowed_mode(self, stop_id: str) -> bool:
+        """True si alguna ruta de la parada está en un modo permitido."""
+        # _stop_to_routes_filtered ya contiene solo rutas permitidas.
+        return bool(self._get_routes_at_stop(stop_id))
+
+    def _candidate_stops(self, coords, margin_km: float, max_stops: int):
+        """Paradas de acceso/egreso respetando filtros de modo.
+
+        Sin filtros activos → comportamiento histórico (N más cercanas).
+        Con filtros → se consulta un pool más amplio y se conservan solo las
+        paradas que sirven un modo permitido, evitando que la densidad de
+        paradas de bus desplace a las estaciones de metro/tren del top-N.
+        """
+        cfg = self.config
+        filters_active = cfg.allowed_modes is not None or bool(cfg.excluded_modes)
+        if not filters_active:
+            return self.gtfs.get_nearby_stops(
+                coords, margin_km=margin_km, max_stops=max_stops
+            )
+
+        # Budget de acceso ampliado por modo (opt-in): permite alcanzar
+        # estaciones de metro/tren más lejanas que la parada de bus más cercana.
+        eff_margin = margin_km
+        if cfg.mode_access_walk_km:
+            relevant = (
+                cfg.allowed_modes
+                if cfg.allowed_modes is not None
+                else [m for m in KNOWN_MODES if m not in cfg.excluded_modes]
+            )
+            for m in relevant:
+                v = cfg.mode_access_walk_km.get(m)
+                if v is not None and v > eff_margin:
+                    eff_margin = v
+
+        pool = self.gtfs.get_nearby_stops(
+            coords, margin_km=eff_margin, max_stops=max(max_stops * 5, 40)
+        )
+        filtered = [
+            (sid, d) for sid, d in pool if self._stop_serves_allowed_mode(sid)
+        ]
+        # Si el filtro deja todo vacío, devolver el pool acotado (find_journey
+        # ya maneja el caso de no encontrar viajes y cae a caminata directa).
+        if not filtered:
+            return pool[:max_stops]
+        return filtered[:max_stops]
+
+    def _mode_allowed(self, route_id: str) -> bool:
+        """Aplica los filtros allowed_modes / excluded_modes del config."""
+        cfg = self.config
+        if not cfg.excluded_modes and cfg.allowed_modes is None:
+            return True
+        mode = self._mode_of(route_id)
+        if cfg.excluded_modes and mode in cfg.excluded_modes:
+            return False
+        if cfg.allowed_modes is not None and mode not in cfg.allowed_modes:
+            return False
+        return True
 
     def _is_transfer_viable(self, from_route: str, stop_id: str, to_route: str) -> bool:
         if not self.transfer_manager:
             return True
+        key = (from_route, stop_id, to_route)
+        cached = self._transfer_viable_cache.get(key)
+        if cached is not None:
+            return cached
+        max_walk = self.config.max_walking_transfer_km
+        result = False
         for transfer in self.transfer_manager.get_transfers_from(from_route, stop_id):
-            if transfer.to_route_id == to_route and transfer.is_viable():
-                # Aplicar también el budget de caminata para transbordo
-                if transfer.walking_distance_km <= self.config.max_walking_transfer_km:
-                    return True
-        return False
+            if (
+                transfer.to_route_id == to_route
+                and transfer.is_viable()
+                and transfer.walking_distance_km <= max_walk
+            ):
+                result = True
+                break
+        self._transfer_viable_cache[key] = result
+        return result
 
-    def _get_next_stops_on_route(
+    def _active_boardings(
         self,
         route_id: str,
+        stop_id: str,
+        stop_info: dict,
+        active_services: frozenset,
+        cache: dict,
+    ) -> list[tuple]:
+        """Lista ordenada de ``(time, trip_id, dispatch_secs)`` de abordajes válidos.
+
+        Construye los boardings expandiendo dispatches (frequencies.txt) sobre
+        los trips que visitan esta parada. La expansión se hace **bajo demanda**
+        y se cachea por request (``cache`` es ``active_times_cache`` del scan):
+        materializar al arranque cuesta ~600 MB en Santiago.
+
+        Si hay ``active_services`` se filtra por ``service_id`` del trip; si la
+        intersección queda vacía se cae al pool sin filtrar (mismo patrón que
+        el viejo ``_active_arrival_times`` — robusto ante gaps de calendar.txt).
+        """
+        key = (route_id, stop_id, active_services)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        trips_here = stop_info.get("trips_here") or []
+        if not trips_here:
+            cache[key] = []
+            return []
+
+        trip_service = self.gtfs.trip_service
+        trip_dispatches = self.gtfs.trip_dispatches
+
+        def _expand(filter_service: bool) -> list:
+            out: list = []
+            for trip_id, offset_secs in trips_here:
+                if filter_service:
+                    sid = trip_service.get(trip_id)
+                    if sid is None or sid not in active_services:
+                        continue
+                dispatches = trip_dispatches.get(trip_id)
+                if not dispatches:
+                    continue
+                for d in dispatches:
+                    abs_secs = d + offset_secs
+                    tod = abs_secs % _SECS_DAY
+                    t = time(tod // 3600, (tod // 60) % 60, tod % 60)
+                    out.append((t, trip_id, d))
+            out.sort(key=lambda x: x[0])
+            return out
+
+        boardings: list = []
+        if active_services:
+            boardings = _expand(filter_service=True)
+        if not boardings:  # sin filtro o filtro vacío → pool completo
+            boardings = _expand(filter_service=False)
+
+        cache[key] = boardings
+        return boardings
+
+    def _next_boarding(
+        self,
+        route_id: str,
+        stop_id: str,
+        after_time: datetime,
+        active_services: frozenset = frozenset(),
+        active_times_cache: dict | None = None,
+    ) -> tuple[datetime, tuple[str, int]] | None:
+        """Primer trip de ``route_id`` cuyo horario en ``stop_id`` ≥ ``after_time``.
+
+        El "trip virtual" es ``(trip_id, dispatch_secs)``: en GTFS frequency-based
+        el mismo trip se despacha varias veces durante el día y cada dispatch es
+        un bus distinto. Sin esto el motor cree que un bus pasa una sola vez al
+        día — origen del bug "viajes imposiblemente rápidos".
+
+        Devuelve ``(boarding_datetime, (trip_id, dispatch_secs))`` o ``None``.
+        """
+        route_stops = self.gtfs.route_stops.get(route_id)
+        if not route_stops:
+            return None
+        stop_info = route_stops.get(stop_id)
+        if not stop_info:
+            return None
+
+        if active_times_cache is None:
+            active_times_cache = {}
+        boardings = self._active_boardings(
+            route_id, stop_id, stop_info, active_services, active_times_cache
+        )
+        if not boardings:
+            return None
+
+        after_time_only = after_time.time()
+        idx = bisect_left(boardings, after_time_only, key=lambda b: b[0])
+        if idx >= len(boardings):
+            return None
+
+        board_time_only, trip_id, dispatch_secs = boardings[idx]
+        board_dt = datetime.combine(after_time.date(), board_time_only)
+        if board_dt < after_time:
+            return None
+        return board_dt, (trip_id, dispatch_secs)
+
+    def _next_stop_on_trip(
+        self,
+        virtual_trip: tuple[str, int],
         current_stop: str,
-        current_time: datetime,
-    ) -> list[tuple[str, datetime]]:
-        graph = self.gtfs.graphs.get(route_id)
-        node_map = self.gtfs._graph_node_maps.get(route_id)
-        idx_to_node = self.gtfs._graph_idx_to_node.get(route_id)
+        ref_dt: datetime,
+    ) -> tuple[str, datetime] | None:
+        """Siguiente ``(stop_id, arrival_datetime)`` del trip virtual.
 
-        if graph is None or not node_map or current_stop not in node_map:
-            return []
+        ``virtual_trip = (trip_id, dispatch_secs)``: el ``trip_id`` indexa la
+        secuencia de offsets (segundos desde el inicio del trip); el
+        ``dispatch_secs`` indica cuándo salió este bus en particular (expandido
+        desde frequencies.txt o la hora absoluta de la primera parada).
 
-        src_idx = node_map[current_stop]
-        successor_indices = graph.successor_indices(src_idx)
-        if not successor_indices:
-            return []
-
-        route_stops = self.gtfs.route_stops.get(route_id, {})
-        current_time_only = current_time.time()
-        fallback_step = timedelta(minutes=self.config.fallback_step_minutes)
-        results: list[tuple[str, datetime]] = []
-
-        for next_idx in successor_indices:
-            next_stop_id = idx_to_node.get(next_idx)
-            if next_stop_id is None:
-                continue
-
-            next_info = route_stops.get(next_stop_id, {})
-            arrival_times = next_info.get("arrival_times") or ()
-
-            next_arrival_dt: datetime | None = None
-            for t in arrival_times:
-                if t >= current_time_only:
-                    next_arrival_dt = datetime.combine(current_time.date(), t)
-                    break
-
-            if next_arrival_dt and next_arrival_dt > current_time:
-                estimated_time = next_arrival_dt
-            else:
-                estimated_time = current_time + fallback_step
-
-            results.append((next_stop_id, estimated_time))
-
-        return results
+        ``ref_dt`` ancla la fecha; si el tiempo absoluto resultante cae antes de
+        ``ref_dt`` se asume cruce de medianoche y se suma un día.
+        """
+        trip_id, dispatch_secs = virtual_trip
+        trip_seq = self.gtfs.trips.get(trip_id)
+        if not trip_seq:
+            return None
+        idx_map = self.gtfs.trip_stop_idx.get(trip_id)
+        if not idx_map:
+            return None
+        idx = idx_map.get(current_stop)
+        if idx is None or idx + 1 >= len(trip_seq):
+            return None
+        next_stop, next_offset = trip_seq[idx + 1]
+        next_abs_secs = dispatch_secs + next_offset
+        next_arr_dt = datetime.combine(ref_dt.date(), datetime.min.time()) + timedelta(
+            seconds=next_abs_secs
+        )
+        if next_arr_dt < ref_dt:
+            next_arr_dt += timedelta(days=1)
+        return next_stop, next_arr_dt
 
     # ────────────────────────────────────────────────────────────────────────
     # Reconstrucción y construcción de Journey
     # ────────────────────────────────────────────────────────────────────────
+
+    def _walk(self, from_latlon, to_latlon, straight_km: float):
+        """Distancia/geometría peatonal real (OSM) con fallback a Haversine.
+
+        Args:
+            from_latlon: ``(lat, lon)`` origen del tramo a pie.
+            to_latlon: ``(lat, lon)`` destino del tramo a pie.
+            straight_km: distancia Haversine ya calculada (fallback).
+
+        Returns:
+            ``(distancia_km, polyline | None)``. Si OSM no está disponible o la
+            ruta es absurda (snapping a isla desconectada), devuelve
+            ``(straight_km, None)`` — comportamiento histórico.
+        """
+        if (
+            self.osm is None
+            or not self.config.use_osm_walking
+            or from_latlon is None
+            or to_latlon is None
+        ):
+            return straight_km, None
+        try:
+            res = self.osm.shortest_path(from_latlon, to_latlon)
+        except Exception:
+            return straight_km, None
+        if not res:
+            return straight_km, None
+        dist_km, poly = res
+        # Guarda de cordura: una ruta OSM > 3x la línea recta suele ser
+        # snapping a un nodo desconectado → preferir Haversine.
+        if straight_km > 0 and dist_km > straight_km * 3:
+            return straight_km, None
+        return dist_km, poly
 
     def _build_direct_walk(
         self,
@@ -440,22 +857,25 @@ class ConnectionScanAlgorithm:
         departure_time: datetime,
         distance_km: float,
     ) -> Journey:
+        osm_km, poly = self._walk(origin_coords, destination_coords, distance_km)
+        distance_km = osm_km
         walk_time_sec = (distance_km / self.config.walking_speed_kmh) * 3600
         end_time = departure_time + timedelta(seconds=walk_time_sec)
+        walk_seg = {
+            "type": "walk",
+            "from": "origin",
+            "to": "destination",
+            "from_latlon": list(origin_coords),
+            "to_latlon": list(destination_coords),
+            "distance_km": distance_km,
+            "duration": timedelta(seconds=walk_time_sec),
+            "start_time": departure_time,
+            "end_time": end_time,
+        }
+        if poly:
+            walk_seg["path"] = poly
         return Journey(
-            segments=[
-                {
-                    "type": "walk",
-                    "from": "origin",
-                    "to": "destination",
-                    "from_latlon": list(origin_coords),
-                    "to_latlon": list(destination_coords),
-                    "distance_km": distance_km,
-                    "duration": timedelta(seconds=walk_time_sec),
-                    "start_time": departure_time,
-                    "end_time": end_time,
-                }
-            ],
+            segments=[walk_seg],
             total_duration=timedelta(seconds=walk_time_sec),
             departure_time=departure_time,
             arrival_time=end_time,
@@ -473,9 +893,11 @@ class ConnectionScanAlgorithm:
         origin_walk_dist: float,
         dest_walk_dist: float,
         actual_departure: datetime,
+        walk_meta: dict | None = None,
     ) -> Journey | None:
         if destination_stop not in in_connection:
             return None
+        walk_meta = walk_meta or {}
 
         # Camino inverso: destination → origin
         path: list[tuple[str, str, str, datetime, datetime]] = []
@@ -493,25 +915,66 @@ class ConnectionScanAlgorithm:
         cfg = self.config
         transfer_duration = timedelta(seconds=cfg.transfer_buffer_seconds)
 
-        # Caminata inicial
-        walk_time_sec = (origin_walk_dist / cfg.walking_speed_kmh) * 3600
-        segments.append(
-            {
-                "type": "walk",
-                "from": "origin",
-                "to": origin_stop,
-                "from_latlon": [origin_coords[0], origin_coords[1]],
-                "distance_km": origin_walk_dist,
-                "duration": timedelta(seconds=walk_time_sec),
-                "start_time": actual_departure,
-                "end_time": actual_departure + timedelta(seconds=walk_time_sec),
-            }
+        # Caminata inicial (origen → primera parada). OSM si está disponible.
+        o_stop_c = self.gtfs.get_stop_coords(origin_stop)
+        o_stop_latlon = (
+            [o_stop_c[1], o_stop_c[0]] if o_stop_c is not None else None
         )
+        origin_walk_dist, o_poly = self._walk(
+            [origin_coords[0], origin_coords[1]], o_stop_latlon, origin_walk_dist
+        )
+        walk_time_sec = (origin_walk_dist / cfg.walking_speed_kmh) * 3600
+        first_walk = {
+            "type": "walk",
+            "from": "origin",
+            "to": origin_stop,
+            "from_latlon": [origin_coords[0], origin_coords[1]],
+            "distance_km": origin_walk_dist,
+            "duration": timedelta(seconds=walk_time_sec),
+            "start_time": actual_departure,
+            "end_time": actual_departure + timedelta(seconds=walk_time_sec),
+        }
+        if o_stop_latlon is not None:
+            first_walk["to_latlon"] = o_stop_latlon
+        if o_poly:
+            first_walk["path"] = o_poly
+        segments.append(first_walk)
 
-        # Tránsito + transbordos
+        # Tránsito + transbordos (incluye footpaths: hops con route "__walk__")
         num_transfers = 0
+        transfer_walk_km = 0.0
         prev_route: str | None = None
+        pending_walk_seg: dict | None = None  # footpath a completar con to_route
         for from_stop, to_stop, route_id, dep_time, arr_time in path:
+            if route_id == "__walk__":
+                # Transbordo caminando entre paradas distintas (footpath).
+                tr = walk_meta.get(to_stop)
+                num_transfers += 1
+                dist_km = getattr(tr, "walking_distance_km", 0.0) if tr else 0.0
+                transfer_walk_km += dist_km
+                seg = {
+                    "type": "transfer",
+                    "from_route": prev_route,
+                    "to_route": None,
+                    "at_stop": from_stop,
+                    "from_stop": from_stop,
+                    "to_stop": to_stop,
+                    "distance_km": dist_km,
+                    "duration": arr_time - dep_time,
+                    "start_time": dep_time,
+                    "end_time": arr_time,
+                    "from_mode": self._mode_of(prev_route) if prev_route else None,
+                    "to_mode": None,
+                }
+                fp = getattr(tr, "walking_path", None) if tr else None
+                if fp:
+                    seg["path"] = fp
+                segments.append(seg)
+                pending_walk_seg = seg
+                # El footpath ES el transbordo; la próxima subida no recuenta.
+                prev_route = None
+                continue
+
             if prev_route is not None and prev_route != route_id:
                 num_transfers += 1
                 segments.append(
@@ -521,43 +984,68 @@ class ConnectionScanAlgorithm:
                         "to_route": route_id,
                         "at_stop": from_stop,
                         "duration": transfer_duration,
+                        "from_mode": self._mode_of(prev_route),
+                        "to_mode": self._mode_of(route_id),
                     }
                 )
-            segments.append(
-                {
-                    "type": "transit",
-                    "route_id": route_id,
-                    "from_stop": from_stop,
-                    "to_stop": to_stop,
-                    "departure_time": dep_time,
-                    "arrival_time": arr_time,
-                    "duration": arr_time - dep_time,
-                }
-            )
+            if pending_walk_seg is not None:
+                # Completar el footpath con la ruta/modo que se aborda al llegar.
+                pending_walk_seg["to_route"] = route_id
+                pending_walk_seg["to_mode"] = self._mode_of(route_id)
+                pending_walk_seg = None
+            transit_seg = {
+                "type": "transit",
+                "route_id": route_id,
+                "from_stop": from_stop,
+                "to_stop": to_stop,
+                "departure_time": dep_time,
+                "arrival_time": arr_time,
+                "duration": arr_time - dep_time,
+                "mode": self._mode_of(route_id),
+            }
+            meta = None
+            getter = getattr(self.gtfs, "get_route_meta", None)
+            if getter:
+                meta = getter(route_id)
+            if meta:
+                transit_seg["route_short_name"] = meta.get("short_name")
+                transit_seg["route_long_name"] = meta.get("long_name")
+                transit_seg["agency_name"] = meta.get("agency_name")
+                transit_seg["route_color"] = meta.get("route_color")
+            segments.append(transit_seg)
             prev_route = route_id
 
-        # Caminata final
+        # Caminata final (última parada → destino). OSM si está disponible.
+        d_stop_c = self.gtfs.get_stop_coords(destination_stop)
+        d_stop_latlon = (
+            [d_stop_c[1], d_stop_c[0]] if d_stop_c is not None else None
+        )
+        dest_walk_dist, d_poly = self._walk(
+            d_stop_latlon,
+            [destination_coords[0], destination_coords[1]],
+            dest_walk_dist,
+        )
         final_walk_time_sec = (dest_walk_dist / cfg.walking_speed_kmh) * 3600
-        last_end = (
-            segments[-1]["arrival_time"]
-            if segments[-1]["type"] == "transit"
-            else segments[-1]["end_time"]
-        )
-        segments.append(
-            {
-                "type": "walk",
-                "from": destination_stop,
-                "to": "destination",
-                "to_latlon": [destination_coords[0], destination_coords[1]],
-                "distance_km": dest_walk_dist,
-                "duration": timedelta(seconds=final_walk_time_sec),
-                "start_time": last_end,
-                "end_time": last_end + timedelta(seconds=final_walk_time_sec),
-            }
-        )
+        _last = segments[-1]
+        last_end = _last.get("arrival_time") or _last.get("end_time")
+        last_walk = {
+            "type": "walk",
+            "from": destination_stop,
+            "to": "destination",
+            "to_latlon": [destination_coords[0], destination_coords[1]],
+            "distance_km": dest_walk_dist,
+            "duration": timedelta(seconds=final_walk_time_sec),
+            "start_time": last_end,
+            "end_time": last_end + timedelta(seconds=final_walk_time_sec),
+        }
+        if d_stop_latlon is not None:
+            last_walk["from_latlon"] = d_stop_latlon
+        if d_poly:
+            last_walk["path"] = d_poly
+        segments.append(last_walk)
 
         total_duration = segments[-1]["end_time"] - segments[0]["start_time"]
-        total_walking = origin_walk_dist + dest_walk_dist
+        total_walking = origin_walk_dist + dest_walk_dist + transfer_walk_km
 
         return Journey(
             segments=segments,
@@ -668,18 +1156,47 @@ class ConnectionScanAlgorithm:
                 key=lambda j: (j.total_walking_distance, j.arrival_time, j.number_of_transfers),
             )
 
-        # "balanced": costo generalizado OTP-style
+        # "balanced" / "prefer_rail": costo generalizado OTP-style
         #   score = duración + transbordos × penalty_costo + caminata × penalty_caminata
+        #           + sesgo de modo (peso de duración + penalty por abordaje)
         # El walking_cost equivale al tiempo extra que un usuario aceptaría caminar
         # para evitar 1 km extra (~5 min adicionales por km, OTP-style).
+        #
+        # El sesgo de modo se aplica SOLO aquí (ranking post-Pareto), nunca en el
+        # eje de tiempo de Dijkstra: un delta negativo en el tiempo volvería la
+        # búsqueda inadmisible. Esto es cómo OTP expone "preferencias de modo".
         walking_cost_seconds_per_km = 5 * 60
         xfer_cost = cfg.transfer_cost_penalty_seconds
+
+        mode_penalty = cfg.mode_transfer_penalty_seconds
+        mode_weight = cfg.mode_preference_weight
+        if profile == "prefer_rail" and mode_penalty is None:
+            mode_penalty = _PREFER_RAIL_TRANSFER_PENALTY
+
+        def mode_delta(j: Journey) -> float:
+            if not mode_penalty and not mode_weight:
+                return 0.0
+            delta = 0.0
+            for s in j.segments:
+                if s.get("type") != "transit":
+                    continue
+                mode = s.get("mode", "bus")
+                if mode_penalty:
+                    delta += mode_penalty.get(mode, 0)
+                if mode_weight:
+                    secs = s.get("duration")
+                    if secs is not None:
+                        delta += secs.total_seconds() * (
+                            mode_weight.get(mode, 1.0) - 1.0
+                        )
+            return delta
 
         def cost(j: Journey) -> float:
             return (
                 j.total_duration.total_seconds()
                 + j.number_of_transfers * xfer_cost
                 + j.total_walking_distance * walking_cost_seconds_per_km
+                + mode_delta(j)
             )
 
         return sorted(journeys, key=cost)

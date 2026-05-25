@@ -8,14 +8,16 @@ services:
     volumes:
       # Datos GTFS y cache de transferencias persisten fuera de la imagen.
       - ./ayatori/data:/app/ayatori/data
-    environment:
-      AYATORI_GTFS_PATH: ayatori/data/GTFS/2023-09-16/GTFS-V100-PO20230916.zip
-      AYATORI_TRANSFERS_CACHE: ayatori/data/cache/transfers.json
-      AYATORI_TRANSFERS_MAX_DIST_KM: "0.5"
+    # Las variables del .env se inyectan en el contenedor al levantar. El mismo
+    # archivo lo lee python-dotenv en local, así config local y Docker coinciden.
+    env_file:
+      - .env
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=2); sys.exit(0 if r.status==200 else 1)"]
       interval: 30s
       timeout: 5s
-      start_period: 300s
+      # Primer arranque sin caches: carga GTFS + grafo OSM + cómputo de
+      # transbordos + shapes sintéticas. Con caches en disco baja a < 1 min.
+      start_period: 900s
       retries: 3
