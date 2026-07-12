@@ -328,7 +328,13 @@ class ConnectionScanAlgorithm:
         # por cada destino alcanzado durante el scan era el mayor costo del
         # request con OSM activo.
         self._apply_osm_walks(result)
-        return result
+        # _apply_osm_walks reajusta llegada/caminata de los N devueltos: una
+        # caminata que en línea recta era corta puede alargarse al seguir calles.
+        # Se reordena con las métricas ya OSM para que el orden mostrado sea
+        # coherente con lo que ve el usuario (p. ej. "fastest" encabeza con la
+        # menor hora de llegada real, no la Haversine). Solo reordena los N ya
+        # elegidos; no cambia cuáles se devuelven.
+        return self._sort_by_profile(result, profile)
 
     # ────────────────────────────────────────────────────────────────────────
     # Núcleo Dijkstra: multi-target
@@ -951,6 +957,30 @@ class ConnectionScanAlgorithm:
             path.append((from_stop, current, route_id, dep_time, arr_time))
             current = from_stop
         path.reverse()
+
+        # ── Colapsar footpath colgante final ────────────────────────────────
+        # Si el destino se alcanzó CAMINANDO desde otra parada (hop "__walk__"
+        # final) y no se aborda nada después, ese footpath es SIEMPRE dominado:
+        # por desigualdad triangular, caminar directo desde donde se bajó del
+        # vehículo (S→destino) es ≤ el desvío S→paradero→destino, y ahorra un
+        # transbordo espurio. Se colapsa dentro de la caminata de egreso: la
+        # parada de bajada real pasa a ser el punto de egreso. Además recupera
+        # viajes de 0 transbordos cuando la estación útil (p. ej. un terminal de
+        # metro) quedó fuera del top-N de max_destination_stops y sólo se podía
+        # "llegar" caminando a un paradero contiguo. (Un footpath sólo se emite
+        # tras bajar de un vehículo, así que a lo sumo hay uno colgante.)
+        if path and path[-1][2] == "__walk__":
+            alight_stop = path[-1][0]
+            alight_coords = self.gtfs.get_stop_coords(alight_stop)
+            if alight_coords is not None:
+                path.pop()
+                destination_stop = alight_stop
+                dest_walk_dist = self._haversine(
+                    alight_coords[0],
+                    alight_coords[1],
+                    destination_coords[1],
+                    destination_coords[0],
+                )
 
         segments: list[dict] = []
         cfg = self.config

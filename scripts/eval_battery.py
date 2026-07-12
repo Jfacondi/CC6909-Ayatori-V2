@@ -106,6 +106,16 @@ def check(name, o, d, profile, expect, allowed):
             extra = modes_in(j) - {m.lower() for m in allowed}
             if extra:
                 issues.append(f"alt{i}: modos no permitidos {extra}")
+        # Invariante: un footpath (transbordo caminando) sólo sirve si después
+        # se aborda algo. Un `transfer` seguido de la caminata de egreso —o que
+        # cierra el viaje— es un transbordo colgante que infla el conteo y parte
+        # el egreso (bug corregido en _reconstruct_journey; ver EVALUACION §fix).
+        segs = j["segments"]
+        for k, s in enumerate(segs):
+            if s["type"] == "transfer":
+                nxt = segs[k + 1] if k + 1 < len(segs) else None
+                if nxt is None or nxt["type"] != "transit":
+                    issues.append(f"alt{i}: transbordo colgante (footpath sin abordaje)")
 
     best = js[0]
     if expect == "walk":
