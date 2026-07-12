@@ -16,15 +16,16 @@ Implementación alineada con prácticas estándar de planificadores de transport
 
 import heapq
 from bisect import bisect_left
-from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from math import asin, cos, radians, sin, sqrt
+from operator import itemgetter
 from typing import Literal
 
 _EARTH_RADIUS_KM = 6371.0
 _SECS_DAY = 24 * 3600
+_FIRST = itemgetter(0)  # clave de orden/bisect sobre boardings (segundos-del-día)
 
 OptimizationProfile = Literal[
     "fastest", "fewer_transfers", "less_walking", "balanced", "prefer_rail"
@@ -80,7 +81,6 @@ class CSAConfig:
     time_horizon_hours: float = 3.0
     max_origin_stops: int = 8
     max_destination_stops: int = 8
-    fallback_step_minutes: float = 2.0  # estimación cuando no hay horario
 
     # ── Modo de transporte (consciente de modo) ──────────────────────────────
     # Todos default None/() → sin sesgo, conducta idéntica a la histórica.
@@ -159,28 +159,11 @@ class ConnectionScanAlgorithm:
         transfer_manager=None,
         config: CSAConfig | None = None,
         osm_graph=None,
-        # — compatibilidad hacia atrás —
-        max_walking_distance_km: float | None = None,
-        walking_speed_kmh: float | None = None,
-        max_transfers: int | None = None,
     ):
         self.gtfs = gtfs_data
         self.transfer_manager = transfer_manager
         self.osm = osm_graph
         self.config = config or CSAConfig()
-
-        # Si llegan kwargs legacy, sobreescriben el default del config.
-        if max_walking_distance_km is not None:
-            self.config.max_walking_to_stop_km = max_walking_distance_km
-        if walking_speed_kmh is not None:
-            self.config.walking_speed_kmh = walking_speed_kmh
-        if max_transfers is not None:
-            self.config.max_transfers = max_transfers
-
-        # Aliases convenientes
-        self.walking_speed = self.config.walking_speed_kmh
-        self.max_walking_km = self.config.max_walking_to_stop_km  # compat externo
-        self.max_transfers = self.config.max_transfers
 
         # Cache route_id → modo (resuelto vía GTFSData.get_route_mode)
         self._route_mode_cache: dict = {}
@@ -189,13 +172,8 @@ class ConnectionScanAlgorithm:
         # Independiente del tiempo/origen → se reusa entre corridas y llamadas.
         self._transfer_viable_cache: dict[tuple[str, str, str], bool] = {}
 
-        # Índice stop→rutas: usa el de GTFSData si ya está construido; lo reconstruye si no
-        self._stop_to_routes: dict = getattr(gtfs_data, "_stop_to_routes", None)
-        if self._stop_to_routes is None:
-            self._stop_to_routes = defaultdict(list)
-            for route_id, stops_dict in gtfs_data.route_stops.items():
-                for sid in stops_dict:
-                    self._stop_to_routes[sid].append(route_id)
+        # Índice stop→rutas (GTFSData siempre lo construye en __init__)
+        self._stop_to_routes: dict = gtfs_data._stop_to_routes
 
         # Si hay filtros de modo activos, pre-filtrar stop→rutas una sola vez
         # para evitar reevaluar _mode_allowed en el hot path de Dijkstra.
@@ -245,9 +223,19 @@ class ConnectionScanAlgorithm:
         active_services: frozenset = frozenset()
         if cfg.respect_calendar and hasattr(self.gtfs, "active_services_on"):
             active_services = self.gtfs.active_services_on(departure_time.date())
-        # Cache local (merge perezoso por (route_id, stop_id)) reutilizado en
-        # toda la corrida multi-origen para no re-fusionar listas de servicios.
-        active_times_cache: dict = {}
+        # Cache de boardings por (route_id, stop_id, active_services). Persiste en
+        # el GTFSData (vive todo el proceso) en vez de por-request: la expansión de
+        # frecuencias es determinística para una fecha dada, así que la API —que
+        # reconstruye un CSA por request— no la re-paga en cada consulta.
+        # ponytail: crece con el working set de paradas consultadas; materializar
+        # TODO costaría ~600 MB (ver _build_route_index). Cap LRU si la huella molesta.
+        active_times_cache = getattr(self.gtfs, "_boardings_cache", None)
+        if active_times_cache is None:
+            active_times_cache = {}
+            try:
+                self.gtfs._boardings_cache = active_times_cache
+            except AttributeError:
+                pass  # gtfs stub sin __dict__ → cae a cache por-request
 
         # ── Caminata directa: si destino está al alcance peatonal, sugerirlo
         direct_dist = self._haversine(
@@ -333,7 +321,14 @@ class ConnectionScanAlgorithm:
 
         # ── Orden final por perfil
         sorted_journeys = self._sort_by_profile(pareto, profile)
-        return sorted_journeys[:num_alternatives]
+        result = sorted_journeys[:num_alternatives]
+
+        # ── Ruteo peatonal OSM solo sobre lo que se devuelve. Pareto/orden se
+        # deciden con Haversine (comportamiento pre-OSM); pagar shortest_path
+        # por cada destino alcanzado durante el scan era el mayor costo del
+        # request con OSM activo.
+        self._apply_osm_walks(result)
+        return result
 
     # ────────────────────────────────────────────────────────────────────────
     # Núcleo Dijkstra: multi-target
@@ -598,11 +593,6 @@ class ConnectionScanAlgorithm:
             self._route_mode_cache[route_id] = mode
         return mode
 
-    def _stop_serves_allowed_mode(self, stop_id: str) -> bool:
-        """True si alguna ruta de la parada está en un modo permitido."""
-        # _stop_to_routes_filtered ya contiene solo rutas permitidas.
-        return bool(self._get_routes_at_stop(stop_id))
-
     def _candidate_stops(self, coords, margin_km: float, max_stops: int):
         """Paradas de acceso/egreso respetando filtros de modo.
 
@@ -635,8 +625,9 @@ class ConnectionScanAlgorithm:
         pool = self.gtfs.get_nearby_stops(
             coords, margin_km=eff_margin, max_stops=max(max_stops * 5, 40)
         )
+        # _stop_to_routes_filtered ya contiene solo rutas de modos permitidos.
         filtered = [
-            (sid, d) for sid, d in pool if self._stop_serves_allowed_mode(sid)
+            (sid, d) for sid, d in pool if self._get_routes_at_stop(sid)
         ]
         # Si el filtro deja todo vacío, devolver el pool acotado (find_journey
         # ya maneja el caso de no encontrar viajes y cae a caminata directa).
@@ -709,6 +700,11 @@ class ConnectionScanAlgorithm:
         trip_dispatches = self.gtfs.trip_dispatches
 
         def _expand(filter_service: bool) -> list:
+            # Boardings como (tod_secs, trip_id, dispatch_secs), tod en segundos
+            # del día (int). Antes se construía un datetime.time por boarding (12M+
+            # objetos por consulta) y se ordenaba con un lambda; el int es un orden
+            # estrictamente monótono equivalente, así que el resultado del bisect
+            # en _next_boarding es idéntico — solo mucho más barato.
             out: list = []
             for trip_id, offset_secs in trips_here:
                 if filter_service:
@@ -719,11 +715,8 @@ class ConnectionScanAlgorithm:
                 if not dispatches:
                     continue
                 for d in dispatches:
-                    abs_secs = d + offset_secs
-                    tod = abs_secs % _SECS_DAY
-                    t = time(tod // 3600, (tod // 60) % 60, tod % 60)
-                    out.append((t, trip_id, d))
-            out.sort(key=lambda x: x[0])
+                    out.append(((d + offset_secs) % _SECS_DAY, trip_id, d))
+            out.sort(key=_FIRST)
             return out
 
         boardings: list = []
@@ -767,12 +760,22 @@ class ConnectionScanAlgorithm:
         if not boardings:
             return None
 
-        after_time_only = after_time.time()
-        idx = bisect_left(boardings, after_time_only, key=lambda b: b[0])
+        # Segundos del día de after_time, con la fracción incluida: el bisect
+        # contra tods enteros reproduce exactamente la frontera del antiguo
+        # comparador de datetime.time (que sí distingue microsegundos, presentes
+        # en after_time cuando viene de un tiempo de caminata fraccionario).
+        after_tod = (
+            after_time.hour * 3600
+            + after_time.minute * 60
+            + after_time.second
+            + after_time.microsecond / 1_000_000
+        )
+        idx = bisect_left(boardings, after_tod, key=_FIRST)
         if idx >= len(boardings):
             return None
 
-        board_time_only, trip_id, dispatch_secs = boardings[idx]
+        tod, trip_id, dispatch_secs = boardings[idx]
+        board_time_only = time(tod // 3600, (tod // 60) % 60, tod % 60)
         board_dt = datetime.combine(after_time.date(), board_time_only)
         if board_dt < after_time:
             return None
@@ -850,6 +853,44 @@ class ConnectionScanAlgorithm:
             return straight_km, None
         return dist_km, poly
 
+    def _apply_osm_walks(self, journeys: list[Journey]) -> None:
+        """Enriquece con ruteo OSM los tramos a pie de acceso/egreso, in place.
+
+        Se llama únicamente sobre los ≤ ``num_alternatives`` viajes que
+        ``find_journey`` retorna. Ajusta distancia, duración, geometría y los
+        agregados del Journey (llegada, duración total, caminata total).
+        Los footpaths de transbordo ya traen distancia/polyline OSM desde el
+        TransferManager, y la caminata directa se construye con OSM — ambos
+        se reconocen por tener ``path`` o faltarles un extremo, y se saltan.
+        """
+        if self.osm is None or not self.config.use_osm_walking:
+            return
+        speed = self.config.walking_speed_kmh
+        for j in journeys:
+            changed = False
+            for seg in j.segments:
+                if seg.get("type") != "walk" or "path" in seg:
+                    continue
+                from_ll = seg.get("from_latlon")
+                to_ll = seg.get("to_latlon")
+                if from_ll is None or to_ll is None:
+                    continue
+                dist_km, poly = self._walk(from_ll, to_ll, seg["distance_km"])
+                if poly:
+                    seg["path"] = poly
+                if dist_km != seg["distance_km"]:
+                    j.total_walking_distance += dist_km - seg["distance_km"]
+                    seg["distance_km"] = dist_km
+                    walk_secs = (dist_km / speed) * 3600
+                    seg["duration"] = timedelta(seconds=walk_secs)
+                    seg["end_time"] = seg["start_time"] + seg["duration"]
+                    changed = True
+            if changed:
+                last_end = j.segments[-1].get("end_time")
+                if last_end is not None:
+                    j.arrival_time = last_end
+                    j.total_duration = last_end - j.departure_time
+
     def _build_direct_walk(
         self,
         origin_coords: tuple[float, float],
@@ -915,13 +956,13 @@ class ConnectionScanAlgorithm:
         cfg = self.config
         transfer_duration = timedelta(seconds=cfg.transfer_buffer_seconds)
 
-        # Caminata inicial (origen → primera parada). OSM si está disponible.
+        # Caminata inicial (origen → primera parada). Distancia Haversine: el
+        # ruteo OSM se aplica después y SOLO a los viajes que se devuelven
+        # (_apply_osm_walks) — hacerlo aquí costaba 2 Dijkstras OSM por cada
+        # destino alcanzado en el scan (hasta ~128 por request).
         o_stop_c = self.gtfs.get_stop_coords(origin_stop)
         o_stop_latlon = (
             [o_stop_c[1], o_stop_c[0]] if o_stop_c is not None else None
-        )
-        origin_walk_dist, o_poly = self._walk(
-            [origin_coords[0], origin_coords[1]], o_stop_latlon, origin_walk_dist
         )
         walk_time_sec = (origin_walk_dist / cfg.walking_speed_kmh) * 3600
         first_walk = {
@@ -936,8 +977,6 @@ class ConnectionScanAlgorithm:
         }
         if o_stop_latlon is not None:
             first_walk["to_latlon"] = o_stop_latlon
-        if o_poly:
-            first_walk["path"] = o_poly
         segments.append(first_walk)
 
         # Tránsito + transbordos (incluye footpaths: hops con route "__walk__")
@@ -1015,15 +1054,11 @@ class ConnectionScanAlgorithm:
             segments.append(transit_seg)
             prev_route = route_id
 
-        # Caminata final (última parada → destino). OSM si está disponible.
+        # Caminata final (última parada → destino). Haversine; OSM diferido a
+        # _apply_osm_walks (misma razón que la caminata inicial).
         d_stop_c = self.gtfs.get_stop_coords(destination_stop)
         d_stop_latlon = (
             [d_stop_c[1], d_stop_c[0]] if d_stop_c is not None else None
-        )
-        dest_walk_dist, d_poly = self._walk(
-            d_stop_latlon,
-            [destination_coords[0], destination_coords[1]],
-            dest_walk_dist,
         )
         final_walk_time_sec = (dest_walk_dist / cfg.walking_speed_kmh) * 3600
         _last = segments[-1]
@@ -1040,8 +1075,6 @@ class ConnectionScanAlgorithm:
         }
         if d_stop_latlon is not None:
             last_walk["from_latlon"] = d_stop_latlon
-        if d_poly:
-            last_walk["path"] = d_poly
         segments.append(last_walk)
 
         total_duration = segments[-1]["end_time"] - segments[0]["start_time"]
@@ -1226,26 +1259,3 @@ class ConnectionScanAlgorithm:
         dl2 = radians(lon2 - lon1) * 0.5
         a = sin(dl) ** 2 + cos(rl1) * cos(rl2) * sin(dl2) ** 2
         return _EARTH_RADIUS_KM * 2.0 * asin(sqrt(a))
-
-
-def create_csa_planner(
-    gtfs_data,
-    transfer_manager=None,
-    config: CSAConfig | None = None,
-    # — compat hacia atrás —
-    max_walking_km: float | None = None,
-    walking_speed_kmh: float | None = None,
-    max_transfers: int | None = None,
-) -> ConnectionScanAlgorithm:
-    """Factory de ConnectionScanAlgorithm.
-
-    Acepta un ``CSAConfig`` o, alternativamente, los kwargs legacy.
-    """
-    return ConnectionScanAlgorithm(
-        gtfs_data,
-        transfer_manager,
-        config=config,
-        max_walking_distance_km=max_walking_km,
-        walking_speed_kmh=walking_speed_kmh,
-        max_transfers=max_transfers,
-    )

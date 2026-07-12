@@ -20,7 +20,7 @@ python -m venv .venv && . .venv/Scripts/activate     # Windows
 pip install -e ".[api,viz]"
 ```
 
-Requiere Python ≥ 3.10. Para soporte OSM (`pyrosm`, `geopandas`), instalar también el extra `geo` — recomendado hacerlo vía conda en Windows por las dependencias geoespaciales binarias.
+Requiere Python ≥ 3.10. Para soporte OSM, instalar el extra `geo` (`osmium`): tiene wheel en Windows (`pip install osmium`), por lo que ya no requiere conda.
 
 ## Descarga de datos
 
@@ -98,8 +98,7 @@ El contenedor monta `ayatori/data/` como volumen. La primera ejecución carga el
 | Método | Path | Detalle |
 |---|---|---|
 | `GET` | `/health` | Estado de carga, conteo de rutas/paradas/transferencias |
-| `GET` | `/config/defaults` | Valores por defecto de `CSAConfig` |
-| `GET` | `/config/schema` | Min/max/step por campo para sliders |
+| `GET` | `/config/schema` | Min/max/step (+ default) por campo para sliders |
 | `GET` | `/stops/nearby` | Paradas cercanas a `(lat, lon)` |
 | `POST` | `/plan` | Planifica un viaje con configuración opcional |
 | `POST` | `/plan/compare` | Ejecuta múltiples variantes de configuración en una sola request |
@@ -109,6 +108,25 @@ Ver `api/README.md` para esquemas detallados y variables de entorno.
 ### Frontend
 
 Página servida en `/` con Leaflet. Click izquierdo = origen, click derecho = destino. Panel lateral con sliders sobre todos los parámetros de `CSAConfig` y modo **comparar** para ejecutar varias configuraciones simultáneas y verlas superpuestas en el mapa.
+
+### Variables de entorno
+
+La API las lee al arrancar (todas opcionales):
+
+| Variable | Default | Para qué |
+|---|---|---|
+| `AYATORI_GTFS_PATH` | feed `2023-09-16` | Feed GTFS a cargar (ej. `ayatori/data/GTFS/GTFS_20260425_v3.zip` para el feed 2026). |
+| `AYATORI_TRANSFERS_CACHE` | `ayatori/data/cache/transfers.json` | Cache de la matriz de transbordos. |
+| `AYATORI_USE_OSM` | `0` | `1` activa el ruteo peatonal real: **las caminatas siguen las calles** en vez de líneas rectas. Requiere `osmium` + un `.pbf`; sin eso degrada a Haversine. |
+| `AYATORI_OSM_PBF` | `ayatori/data/OSM/Santiago.osm.pbf` | Archivo OSM para el grafo peatonal. |
+
+```bash
+# Feed 2026 + caminatas siguiendo calles
+AYATORI_GTFS_PATH=ayatori/data/GTFS/GTFS_20260425_v3.zip \
+AYATORI_TRANSFERS_CACHE=ayatori/data/cache/transfers_2026.json \
+AYATORI_USE_OSM=1 \
+  uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
 
 ---
 
@@ -120,9 +138,32 @@ Página servida en `/` con Leaflet. Click izquierdo = origen, click derecho = de
 | `TransferManager` | `ayatori/models/TransferConnection.py` | Persistencia y consulta O(1) de transferencias precomputadas |
 | `ConnectionScanAlgorithm` | `ayatori/models/ConnectionScanAlgorithm.py` | Motor de ruteo multi-target con Dijkstra + Pareto |
 | `JourneyPlannerV2` | `ayatori/models/JourneyPlannerV2.py` | Wrapper de alto nivel orientado a casos de uso |
-| `OSMGraph` | `ayatori/models/OSMGraph.py` | Red peatonal opcional (rustworkx, requiere pyrosm) |
+| `OSMGraph` | `ayatori/models/OSMGraph.py` | Red peatonal opcional (rustworkx, requiere osmium) |
 | `api/` | `api/main.py`, `api/schemas.py` | FastAPI + Pydantic |
-| `api/static/` | `index.html`, `app.js` | Frontend Leaflet (sin build step) |
+| `api/static/` | `index.html`, `js/` (módulos), `css/` | Frontend Leaflet (sin build step) |
+
+---
+
+## Algoritmos
+
+El motor combina varias técnicas. El **detalle de implementación de cada una**
+(dónde vive, estructuras de datos, paso a paso, complejidad) está en
+[`docs/ARQUITECTURA.md` §4](docs/ARQUITECTURA.md); los flujos con diagramas, en
+[`docs/MAPA_IMPLEMENTACION.md`](docs/MAPA_IMPLEMENTACION.md).
+
+| Algoritmo / técnica | Dónde | Para qué |
+|---|---|---|
+| **CSA multi-target** (Dijkstra one-to-many con etiquetas) | `ConnectionScanAlgorithm._connection_scan_multi_target` | Viaje más temprano desde un origen hacia *todos* los destinos candidatos en una corrida |
+| **Frente de Pareto 3D** `(llegada, transbordos, caminata)` | `_pareto_filter` | Quedarse con los viajes no dominados |
+| **Costo generalizado + perfiles** (estilo OTP) | `_sort_by_profile` | Rankear el frente según el perfil sin romper la admisibilidad de Dijkstra |
+| **Búsqueda binaria** (`bisect`) | `_next_boarding` | Primer abordaje de una ruta con horario ≥ ahora, en O(log n) |
+| **Expansión de frecuencias** (trip virtual) | `GTFSData._expand_frequencies` | Convertir `frequencies.txt` en despachos discretos |
+| **Índice invertido + índices por trip** | `GTFSData._build_route_index` | `parada→rutas` y "siguiente parada del mismo bus" en O(1) |
+| **k-d tree** (`cKDTree`) | `GTFSData`/`OSMGraph._build_spatial_index` | Paradas/nodos cercanos en O(log n) |
+| **Precómputo de transbordos** | `compute_all_transfers` + `TransferManager` | Viabilidad de transbordo como consulta O(1) |
+| **Dijkstra peatonal** (`rustworkx`) | `OSMGraph.shortest_path` | Distancia y geometría real a pie (fallback Haversine) |
+| **Calendario** (`calendar` + `calendar_dates`) | `GTFSData.active_services_on` | Servicios activos por fecha, con fallback robusto |
+| **Recorte de polyline por proyección** | `GTFSData.get_route_shape_segment` | Trazado real de un tramo entre dos paradas |
 
 ---
 
@@ -143,4 +184,4 @@ Tipos: `mypy` configurado en modo permisivo en `ayatori/`, estricto en `api/`.
 
 ## Roadmap
 
-Ver [`todo.md`](todo.md). El planificador `JourneyPlanner` (V1) está marcado como `DeprecationWarning` y se removerá en 0.3.0.
+Trabajo pendiente para el cierre de la memoria en [`todo.md`](todo.md). El planificador `JourneyPlanner` (V1) fue removido; el motor es `ConnectionScanAlgorithm`, con `JourneyPlannerV2` como wrapper de alto nivel.

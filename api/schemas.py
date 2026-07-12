@@ -7,21 +7,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ayatori.models.ConnectionScanAlgorithm import KNOWN_MODES
+
 OptimizationProfile = Literal[
     "fastest", "fewer_transfers", "less_walking", "balanced", "prefer_rail"
 ]
 LatLon = tuple[float, float]
-
-KNOWN_MODES = (
-    "bus",
-    "metro",
-    "rail",
-    "tram",
-    "ferry",
-    "cable",
-    "gondola",
-    "funicular",
-)
 
 
 class ConfigOverride(BaseModel):
@@ -44,7 +35,6 @@ class ConfigOverride(BaseModel):
     time_horizon_hours: float | None = Field(None, ge=0.5, le=12.0)
     max_origin_stops: int | None = Field(None, ge=1, le=30)
     max_destination_stops: int | None = Field(None, ge=1, le=30)
-    fallback_step_minutes: float | None = Field(None, ge=0.5, le=30.0)
 
     # Consciente de modo
     allowed_modes: list[str] | None = Field(
@@ -86,6 +76,13 @@ class ConfigOverride(BaseModel):
         return v
 
 
+def _validate_latlon(v):
+    lat, lon = v
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError("coordenadas fuera de rango (lat∈[-90,90], lon∈[-180,180])")
+    return v
+
+
 class PlanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,6 +92,11 @@ class PlanRequest(BaseModel):
     num_alternatives: int = Field(3, ge=1, le=10)
     profile: OptimizationProfile = "balanced"
     config: ConfigOverride | None = None
+
+    @field_validator("origin", "destination")
+    @classmethod
+    def _coords(cls, v):
+        return _validate_latlon(v)
 
 
 class LabeledConfig(BaseModel):
@@ -113,6 +115,11 @@ class ComparePlanRequest(BaseModel):
     destination: LatLon
     departure: datetime
     variants: list[LabeledConfig] = Field(..., min_length=1, max_length=6)
+
+    @field_validator("origin", "destination")
+    @classmethod
+    def _coords(cls, v):
+        return _validate_latlon(v)
 
 
 class SegmentDTO(BaseModel):
@@ -146,6 +153,9 @@ class SegmentDTO(BaseModel):
     route_color: str | None = None
     from_stop_name: str | None = None
     to_stop_name: str | None = None
+    # transit — líneas comunes: otras líneas que cubren este mismo tramo
+    # (mismos paraderos de subida/bajada), como opciones de recorrido.
+    route_options: list[dict] | None = None
     # transfer
     from_route: str | None = None
     to_route: str | None = None
@@ -200,7 +210,6 @@ class GeocodeResult(BaseModel):
     lat: float
     lon: float
     type: str | None = None
-    importance: float | None = None
 
 
 class HealthResponse(BaseModel):
@@ -209,6 +218,10 @@ class HealthResponse(BaseModel):
     num_routes: int
     num_stops: int
     num_transfers: int
+    # Rango de validez del feed (ISO 'YYYY-MM-DD'); lo consume el frontend para
+    # los límites del selector de fecha. None si el feed no trae calendario.
+    feed_start: str | None = None
+    feed_end: str | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -305,12 +318,67 @@ def _serialize_segment(seg: dict, gtfs) -> dict:
     return out
 
 
+def _common_lines_by_index(segments: list[dict], gtfs) -> dict[int, list[dict]]:
+    """Mapea índice de hop transit → líneas comunes de su tramo.
+
+    El CSA emite un segmento ``transit`` por par de paradas consecutivas. Aquí
+    agrupamos los hops contiguos de la misma ``route_id`` (un *tramo* completo,
+    desde la subida hasta la bajada, sin cruzar transbordos), calculamos las
+    líneas que cubren ese mismo tramo (mismos paraderos) vía
+    :meth:`GTFSData.common_lines_for_segment`, y asignamos la lista a **cada**
+    hop del tramo. Así la consolidación del frontend (que fusiona los hops del
+    mismo ``route_id``) conserva ``route_options`` en el segmento resultante.
+    """
+    fn = getattr(gtfs, "common_lines_for_segment", None)
+    if fn is None:
+        return {}
+
+    out: dict[int, list[dict]] = {}
+    n = len(segments)
+    i = 0
+    while i < n:
+        s = segments[i]
+        if s.get("type") != "transit":
+            i += 1
+            continue
+        route_id = s.get("route_id")
+        # Tramo = hops contiguos [i, j) con la misma route_id.
+        j = i
+        leg_stops = [s.get("from_stop")]
+        while (
+            j < n
+            and segments[j].get("type") == "transit"
+            and segments[j].get("route_id") == route_id
+        ):
+            leg_stops.append(segments[j].get("to_stop"))
+            j += 1
+
+        if route_id is not None:
+            try:
+                opts = fn(route_id, leg_stops, s.get("departure_time"))
+            except Exception:
+                opts = []
+            if opts:
+                for k in range(i, j):
+                    out[k] = opts
+        i = j
+    return out
+
+
 def journey_to_dto(journey, gtfs) -> JourneyDTO:
+    leg_options = _common_lines_by_index(journey.segments, gtfs)
+    seg_dtos: list[SegmentDTO] = []
+    for i, s in enumerate(journey.segments):
+        out = _serialize_segment(s, gtfs)
+        opts = leg_options.get(i)
+        if opts:
+            out["route_options"] = opts
+        seg_dtos.append(SegmentDTO.model_validate(out))
     return JourneyDTO(
         total_duration_seconds=journey.total_duration.total_seconds(),
         departure_time=journey.departure_time,
         arrival_time=journey.arrival_time,
         number_of_transfers=journey.number_of_transfers,
         total_walking_distance_km=journey.total_walking_distance,
-        segments=[SegmentDTO.model_validate(_serialize_segment(s, gtfs)) for s in journey.segments],
+        segments=seg_dtos,
     )

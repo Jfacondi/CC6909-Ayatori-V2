@@ -2,212 +2,276 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
-  <title>Ayatori — Simulador de viajes</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ayatori — Planificador de viajes</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚍</text></svg>" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="description" content="Planificador multimodal de transporte público para Santiago (GTFS + OSM)." />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
-  <style>
-    :root {
-      --bg: #0f172a;
-      --panel: #1e293b;
-      --panel-2: #334155;
-      --text: #e2e8f0;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --accent-2: #a78bfa;
-      --good: #4ade80;
-    }
-    * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-                 background: var(--bg); color: var(--text); }
-    #app { display: grid; grid-template-columns: 380px 1fr; height: 100vh; }
-    aside { background: var(--panel); overflow-y: auto; padding: 16px; border-right: 1px solid #0b1224; }
-    main  { position: relative; }
-    #map  { width: 100%; height: 100%; }
-    h1 { font-size: 18px; margin: 0 0 6px 0; }
-    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
-         margin: 18px 0 8px; }
-    label { display: block; font-size: 12px; color: var(--muted); margin-top: 8px; }
-    input[type="text"], input[type="datetime-local"], input[type="number"], select {
-      width: 100%; background: var(--panel-2); color: var(--text);
-      border: 1px solid #475569; border-radius: 6px; padding: 6px 8px; font-size: 13px;
-    }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .slider-row { display: grid; grid-template-columns: 1fr 60px; gap: 8px; align-items: center; }
-    .slider-row input[type="range"] { width: 100%; }
-    .slider-row span { font-size: 12px; color: var(--good); text-align: right; }
-    button {
-      width: 100%; padding: 8px 12px; margin-top: 12px; cursor: pointer;
-      background: var(--accent); color: #0b1224; border: 0; border-radius: 6px;
-      font-weight: 600; font-size: 14px;
-    }
-    button.secondary { background: var(--panel-2); color: var(--text); }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px;
-             background: var(--panel-2); color: var(--muted); margin-right: 4px; }
-    .result-card { background: var(--panel-2); padding: 10px; border-radius: 6px; margin-bottom: 8px;
-                   border-left: 4px solid transparent; cursor: pointer; transition: background 0.15s; }
-    .result-card:hover { background: #475569; }
-    .result-card.active { background: #475569; }
-    .result-card .title { font-weight: 600; font-size: 13px; }
-    .result-card .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    .seg-list { font-size: 11px; margin-top: 6px; line-height: 1.5; }
-    .seg-walk   { color: #E69F00; }
-    .seg-transit{ color: #56B4E9; }
-    .seg-transfer{ color: #CC79A7; }
-    .seg-hops { color: var(--muted); font-size: 10px; font-weight: 500; }
-    /* Timeline paso a paso */
-    .timeline { list-style: none; margin: 8px 0 0; padding: 0; border-left: 2px solid #475569;
-                margin-left: 6px; }
-    .timeline li { position: relative; padding: 3px 0 7px 14px; font-size: 11px; line-height: 1.4; }
-    .timeline li::before { content: ""; position: absolute; left: -6px; top: 6px; width: 8px;
-                height: 8px; border-radius: 50%; background: var(--muted); }
-    .timeline li.tl-wait::before { background: transparent; border: 2px dashed var(--muted);
-                left: -7px; }
-    .timeline .tl-time { color: var(--muted); }
-    .timeline .tl-wait { color: #94a3b8; font-style: italic; }
-    /* Selector de modos */
-    .modes-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
-    .mode-chip { display: flex; align-items: center; gap: 4px; font-size: 12px;
-                 background: var(--panel-2); border: 1px solid #475569; border-radius: 14px;
-                 padding: 3px 9px; cursor: pointer; color: var(--text); user-select: none; }
-    .mode-chip input { accent-color: var(--accent); margin: 0; }
-    .mode-chip.off { opacity: 0.4; }
-    /* Leyenda sobre el mapa */
-    .legend { position: absolute; bottom: 16px; right: 12px; z-index: 500;
-              background: rgba(15,23,42,.92); border: 1px solid #334155; border-radius: 8px;
-              padding: 8px 10px; font-size: 11px; color: var(--text); max-width: 180px; }
-    .legend h3 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase;
-                 letter-spacing: .06em; color: var(--muted); }
-    .legend .lg-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
-    .legend .sw { width: 16px; height: 4px; border-radius: 2px; display: inline-block; }
-    .empty-msg { background: var(--panel-2); border-left: 4px solid #E69F00; padding: 10px;
-                 border-radius: 6px; font-size: 12px; color: var(--text); }
-    /* Dropdown del geocoder */
-    .geo-field { position: relative; }
-    .geo-field input.geo-loading {
-      background-image: linear-gradient(90deg, transparent, rgba(56,189,248,.25), transparent);
-      background-size: 200% 100%; background-repeat: no-repeat;
-      animation: geo-shimmer 1.1s linear infinite;
-    }
-    @keyframes geo-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-    .geo-dropdown {
-      position: absolute; left: 0; right: 0; top: 100%; z-index: 1000;
-      background: var(--panel-2); border: 1px solid #475569; border-top: 0;
-      border-radius: 0 0 6px 6px; max-height: 240px; overflow-y: auto;
-      display: none; box-shadow: 0 6px 14px rgba(0,0,0,.4);
-    }
-    .geo-dropdown.open { display: block; }
-    .geo-option {
-      padding: 6px 8px; font-size: 12px; cursor: pointer; line-height: 1.3;
-      border-bottom: 1px solid #1e293b; color: var(--text);
-    }
-    .geo-option:last-child { border-bottom: 0; }
-    .geo-option:hover, .geo-option.active { background: #475569; }
-    .geo-option .geo-type { color: var(--muted); font-size: 10px; margin-left: 4px;
-                            text-transform: uppercase; }
-    .geo-empty { padding: 8px; font-size: 12px; color: var(--muted); text-align: center;
-                 font-style: italic; }
-    details { background: var(--panel-2); border-radius: 6px; padding: 8px 10px; }
-    details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
-    .mode-toggle { display: flex; gap: 4px; margin-bottom: 8px; }
-    .mode-toggle button { flex: 1; margin-top: 0; padding: 6px; font-size: 12px; }
-    .mode-toggle button.active { background: var(--accent); color: #0b1224; }
-    .mode-toggle button.inactive { background: var(--panel-2); color: var(--text); }
-    .variant-card { background: var(--panel-2); padding: 8px; border-radius: 6px; margin-bottom: 6px;
-                    border-left: 4px solid; }
-    .variant-card input { width: 100%; }
-    #status { font-size: 11px; color: var(--muted); margin-top: 6px; }
-    .footer { font-size: 11px; color: var(--muted); margin-top: 24px; padding-top: 8px;
-              border-top: 1px solid #334155; }
-  </style>
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/css/components.css" />
+  <link rel="stylesheet" href="/static/css/layout.css" />
 </head>
 <body>
-  <div id="app">
-    <aside>
-      <h1>Ayatori — Simulador</h1>
-      <div id="health" class="badge">cargando...</div>
+  <!-- ── Sprite de iconos (oculto; se referencia con <use href="#..."/>) ──── -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-bus" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="18" height="14" rx="2.5"/>
+      <path d="M3 11h18"/><path d="M6.5 17v2M17.5 17v2"/>
+      <circle cx="7.5" cy="14" r=".6" fill="currentColor" stroke="none"/>
+      <circle cx="16.5" cy="14" r=".6" fill="currentColor" stroke="none"/>
+    </symbol>
+    <symbol id="i-train" viewBox="0 0 24 24">
+      <rect x="5" y="3" width="14" height="14" rx="3.5"/>
+      <path d="M5 11h14"/>
+      <circle cx="8.5" cy="14" r=".6" fill="currentColor" stroke="none"/>
+      <circle cx="15.5" cy="14" r=".6" fill="currentColor" stroke="none"/>
+      <path d="M7 17l-2 3M17 17l2 3"/>
+    </symbol>
+    <symbol id="i-tram" viewBox="0 0 24 24">
+      <rect x="5" y="4" width="14" height="13" rx="2.5"/>
+      <path d="M5 11h14M12 4V2M9 2h6"/>
+      <path d="M7 17l-1.5 3M17 17l1.5 3"/>
+    </symbol>
+    <symbol id="i-ferry" viewBox="0 0 24 24">
+      <path d="M3 17l1.6-5.2a1 1 0 0 1 .96-.7h12.9a1 1 0 0 1 .96.7L21 17"/>
+      <path d="M12 3v3M7 11V7h10v4"/>
+      <path d="M2.5 17c1.5 0 1.5 1.4 3 1.4S9 17 10.5 17s1.5 1.4 3 1.4S17 17 18.5 17s1.5 1.4 3 1.4"/>
+    </symbol>
+    <symbol id="i-cable" viewBox="0 0 24 24">
+      <path d="M3 5h18"/><path d="M9 5l3 4 3-4"/>
+      <rect x="7" y="9" width="10" height="7" rx="1.5"/><path d="M12 9v7"/>
+    </symbol>
+    <symbol id="i-walk" viewBox="0 0 24 24">
+      <circle cx="13" cy="4" r="1.8" fill="currentColor" stroke="none"/>
+      <path d="M11 21l1.5-5.5L10 12l.8-4.2 3.4 1.6 1.3 2.4 2.2 1"/>
+      <path d="M12.5 15.5L9 19"/>
+    </symbol>
+    <symbol id="i-transfer" viewBox="0 0 24 24">
+      <path d="M4 8h13l-3-3M20 16H7l3 3"/>
+    </symbol>
+    <symbol id="i-swap" viewBox="0 0 24 24">
+      <path d="M7 4v16M7 4L4 7M7 4l3 3M17 20V4M17 20l-3-3M17 20l3-3"/>
+    </symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>
+    </symbol>
+    <symbol id="i-location" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+      <circle cx="12" cy="12" r="8.5"/>
+    </symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24">
+      <path d="M12 21s-6.5-5.5-6.5-10A6.5 6.5 0 0 1 18.5 11c0 4.5-6.5 10-6.5 10z"/>
+      <circle cx="12" cy="11" r="2.3"/>
+    </symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="4"/>
+      <path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/>
+    </symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24">
+      <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>
+    </symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24">
+      <circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/>
+      <path d="M8.2 10.9l7.6-3.8M8.2 13.1l7.6 3.8"/>
+    </symbol>
+    <symbol id="i-print" viewBox="0 0 24 24">
+      <path d="M6 9V3h12v6M6 18H4v-7h16v7h-2"/><rect x="7" y="15" width="10" height="6" rx="1"/>
+    </symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/></symbol>
+    <symbol id="i-route" viewBox="0 0 24 24">
+      <circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/>
+      <path d="M8.5 19H14a3 3 0 0 0 0-6h-4a3 3 0 0 1 0-6h5.5"/>
+    </symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/></symbol>
+    <symbol id="i-balanced" viewBox="0 0 24 24"><path d="M12 3v18M5 7h14M5 7l-2.5 6h5zM19 7l-2.5 6h5z"/></symbol>
+  </svg>
 
-      <div class="mode-toggle">
-        <button id="mode-single" class="active">Plan único</button>
-        <button id="mode-compare" class="inactive">Comparar configs</button>
-      </div>
+  <div class="app" id="app">
+    <!-- ── Panel lateral / bottom sheet ───────────────────────────────────── -->
+    <aside class="panel" id="panel" data-state="full" aria-label="Controles del planificador">
+      <div class="sheet-grip" id="sheet-grip" role="button" tabindex="0"
+           aria-label="Arrastrar para expandir o contraer el panel"></div>
 
-      <h2>Origen / Destino</h2>
-      <label>Origen</label>
-      <div class="geo-field">
-        <input id="origin" type="text" autocomplete="off"
-               placeholder="Dirección o lat, lon"
-               value="-33.4372, -70.6506"
-               data-lat="-33.4372" data-lon="-70.6506" />
-        <div id="origin-dropdown" class="geo-dropdown"></div>
-      </div>
-      <label>Destino</label>
-      <div class="geo-field">
-        <input id="destination" type="text" autocomplete="off"
-               placeholder="Dirección o lat, lon"
-               value="-33.4489, -70.6693"
-               data-lat="-33.4489" data-lon="-70.6693" />
-        <div id="destination-dropdown" class="geo-dropdown"></div>
-      </div>
-      <div id="status">Escribe una dirección (ej: "Plaza de Armas, Santiago") o coordenadas. Click izq = origen, der = destino.</div>
-
-      <h2>Hora de salida</h2>
-      <input id="departure" type="datetime-local" value="2026-04-27T08:00" />
-      <div class="footer" style="margin-top:4px;padding-top:4px;border:0">Feed válido: 25-04-2026 a 31-12-2026</div>
-
-      <h2>Búsqueda</h2>
-      <div class="row">
+      <header class="brand">
+        <div class="brand__logo" aria-hidden="true">🧭</div>
         <div>
-          <label>Alternativas</label>
-          <input id="num_alternatives" type="number" min="1" max="10" value="5" />
+          <h1 class="brand__title">Ayatori</h1>
+          <div class="brand__sub">Planificador multimodal · Santiago</div>
         </div>
-        <div>
-          <label>Perfil</label>
-          <select id="profile">
-            <option value="balanced">balanced</option>
-            <option value="fastest">fastest</option>
-            <option value="fewer_transfers">fewer_transfers</option>
-            <option value="less_walking">less_walking</option>
-            <option value="prefer_rail">prefer_rail</option>
-          </select>
+        <div class="brand__spacer"></div>
+        <button class="btn btn--icon" id="btn-theme" aria-label="Cambiar tema" data-tip="Cambiar tema">
+          <svg class="icon"><use href="#i-moon"></use></svg>
+        </button>
+      </header>
+
+      <div class="panel__scroll">
+        <div class="health" id="health" data-status="loading" aria-live="polite">cargando estado…</div>
+
+        <div class="segmented" role="tablist" aria-label="Modo de planificación">
+          <button class="segmented__btn" id="tab-single" role="tab" aria-selected="true">Plan único</button>
+          <button class="segmented__btn" id="tab-compare" role="tab" aria-selected="false">Comparar</button>
         </div>
-      </div>
 
-      <div id="modes-section">
-        <h2>Modos de transporte</h2>
-        <div id="modes" class="modes-grid"></div>
-      </div>
+        <!-- Origen / destino -->
+        <section class="section" aria-label="Origen y destino">
+          <div class="od">
+            <div class="od__rail" aria-hidden="true">
+              <span class="od__pin od__pin--a"></span>
+              <span class="od__line"></span>
+              <span class="od__pin od__pin--b"></span>
+            </div>
+            <div class="od__fields">
+              <div class="field">
+                <label class="visually-hidden" for="origin">Origen</label>
+                <input id="origin" class="input" type="text" autocomplete="off"
+                       placeholder="Origen — dirección o lat, lon"
+                       role="combobox" aria-expanded="false" aria-autocomplete="list"
+                       aria-controls="origin-dropdown" />
+                <div id="origin-dropdown" class="geo-dropdown" role="listbox"></div>
+              </div>
+              <div class="field">
+                <label class="visually-hidden" for="destination">Destino</label>
+                <input id="destination" class="input" type="text" autocomplete="off"
+                       placeholder="Destino — dirección o lat, lon"
+                       role="combobox" aria-expanded="false" aria-autocomplete="list"
+                       aria-controls="destination-dropdown" />
+                <div id="destination-dropdown" class="geo-dropdown" role="listbox"></div>
+              </div>
+              <button class="btn btn--icon od__swap" id="btn-swap"
+                      aria-label="Intercambiar origen y destino" data-tip="Intercambiar">
+                <svg class="icon"><use href="#i-swap"></use></svg>
+              </button>
+            </div>
+          </div>
+          <div class="field-actions">
+            <button class="btn btn--ghost btn--sm" id="btn-geoloc">
+              <svg class="icon"><use href="#i-location"></use></svg> Mi ubicación
+            </button>
+          </div>
+          <p id="status" class="brand__sub">
+            Toca el mapa para fijar el <strong style="color:var(--success)">origen</strong>;
+            mantén pulsado (o click derecho) para el <strong style="color:var(--danger)">destino</strong>.
+          </p>
+        </section>
 
-      <div id="single-panel">
-        <h2>Configuración CSA</h2>
-        <div id="sliders"></div>
-        <button id="btn-plan">Planificar</button>
-        <button id="btn-reset" class="secondary">Restaurar defaults</button>
-      </div>
+        <!-- Hora de salida -->
+        <section class="section" aria-label="Hora de salida">
+          <h2 class="section__title">Salida</h2>
+          <div class="field-actions">
+            <input id="departure" class="input" type="datetime-local" style="flex:2" />
+            <button class="btn btn--ghost btn--sm" id="btn-now" style="flex:1">
+              <svg class="icon"><use href="#i-clock"></use></svg> Ahora
+            </button>
+          </div>
+          <p id="feed-note" class="brand__sub" style="margin:0"></p>
+        </section>
 
-      <div id="compare-panel" style="display:none">
-        <h2>Variantes</h2>
-        <div id="variants"></div>
-        <button id="btn-add-variant" class="secondary">+ Agregar variante</button>
-        <button id="btn-compare">Comparar</button>
-      </div>
+        <!-- Perfil -->
+        <section class="section" aria-label="Perfil de optimización">
+          <h2 class="section__title">Perfil</h2>
+          <div id="profiles" class="profiles" role="group" aria-label="Perfil de optimización"></div>
+        </section>
 
-      <h2>Resultados</h2>
-      <div id="results"></div>
+        <!-- Modos -->
+        <section class="section" id="modes-section" aria-label="Modos de transporte">
+          <h2 class="section__title">Modos de transporte</h2>
+          <div id="modes" class="modes-grid"></div>
+        </section>
 
-      <div class="footer">
-        Click una alternativa para resaltarla en el mapa.
+        <!-- Búsqueda -->
+        <section class="section">
+          <h2 class="section__title">Alternativas</h2>
+          <div class="field">
+            <input id="num_alternatives" class="input" type="number" min="1" max="10" value="5"
+                   aria-label="Número de alternativas" />
+          </div>
+        </section>
+
+        <!-- Panel modo único -->
+        <div id="single-panel">
+          <details class="accordion" id="advanced">
+            <summary>
+              <svg class="icon"><use href="#i-info"></use></svg>
+              Opciones avanzadas (CSA)
+              <svg class="icon chevron"><use href="#i-chevron"></use></svg>
+            </summary>
+            <div class="accordion__body">
+              <div id="sliders"></div>
+              <button class="btn btn--ghost btn--sm btn--block" id="btn-reset">Restaurar valores por defecto</button>
+            </div>
+          </details>
+          <button class="btn btn--primary btn--block" id="btn-plan" style="margin-top:var(--space-3)">
+            <svg class="icon"><use href="#i-search"></use></svg> Planificar
+          </button>
+        </div>
+
+        <!-- Panel modo comparar -->
+        <div id="compare-panel" style="display:none">
+          <h2 class="section__title" style="margin-bottom:var(--space-2)">Variantes</h2>
+          <div id="variants"></div>
+          <button class="btn btn--ghost btn--sm btn--block" id="btn-add-variant" style="margin-bottom:var(--space-2)">
+            <svg class="icon"><use href="#i-plus"></use></svg> Agregar variante
+          </button>
+          <button class="btn btn--primary btn--block" id="btn-compare">
+            <svg class="icon"><use href="#i-search"></use></svg> Comparar
+          </button>
+        </div>
+
+        <!-- Resultados -->
+        <section class="section" aria-label="Resultados">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2)">
+            <h2 class="section__title">Resultados</h2>
+            <div style="display:flex;gap:var(--space-1)">
+              <button class="btn btn--icon btn--sm" id="btn-share" aria-label="Compartir viaje"
+                      data-tip="Copiar enlace" hidden>
+                <svg class="icon"><use href="#i-share"></use></svg>
+              </button>
+              <button class="btn btn--icon btn--sm" id="btn-print" aria-label="Imprimir itinerario"
+                      data-tip="Imprimir" hidden>
+                <svg class="icon"><use href="#i-print"></use></svg>
+              </button>
+            </div>
+          </div>
+          <div id="results" class="results" aria-live="polite"></div>
+        </section>
       </div>
     </aside>
-    <main>
+
+    <!-- ── Mapa ───────────────────────────────────────────────────────────── -->
+    <main class="map-wrap">
       <div id="map"></div>
-      <div id="legend" class="legend" style="display:none"></div>
+
+      <div class="map-fab">
+        <button class="btn btn--icon" id="btn-theme-map" aria-label="Cambiar tema" data-tip="Cambiar tema">
+          <svg class="icon"><use href="#i-moon"></use></svg>
+        </button>
+      </div>
+
+      <div class="map-hint" id="map-hint">
+        <svg class="icon"><use href="#i-pin"></use></svg>
+        Elige origen y destino, luego pulsa «Planificar».
+      </div>
+
+      <div class="map-overlay" id="map-overlay" aria-hidden="true">
+        <div class="map-overlay__box">
+          <span class="spinner"></span> Calculando rutas…
+        </div>
+      </div>
+
+      <div class="legend" id="legend"></div>
     </main>
   </div>
 
+  <div class="toast-stack" id="toasts" aria-live="assertive" aria-atomic="false"></div>
+
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>

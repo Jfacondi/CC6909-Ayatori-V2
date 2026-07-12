@@ -61,18 +61,6 @@ class TransferConnection:
 
         return True
 
-    def get_total_transfer_time(self, waiting_time_seconds: int = 0) -> float:
-        """
-        Calcula el tiempo total de transbordo.
-
-        Args:
-            waiting_time_seconds: Tiempo de espera adicional (opcional)
-
-        Returns:
-            Tiempo total en segundos (caminata + espera)
-        """
-        return self.walking_time_seconds + waiting_time_seconds
-
     def __repr__(self):
         return (
             f"Transfer(Route {self.from_route_id}->{self.to_route_id}, "
@@ -112,9 +100,6 @@ class TransferManager:
         # {(from_route, from_stop): [TransferConnection, ...]}
         self.transfers: dict[tuple, list] = {}
 
-        # {to_route_id: [(from_route, from_stop, TransferConnection), ...]}
-        self.transfers_by_destination: dict[str, list] = {}
-
         # Conjunto de claves únicas para deduplicación en O(1)
         # (from_route, from_stop, to_route, to_stop)
         self._seen: set = set()
@@ -141,12 +126,6 @@ class TransferManager:
         if key not in self.transfers:
             self.transfers[key] = []
         self.transfers[key].append(transfer)
-
-        if transfer.to_route_id not in self.transfers_by_destination:
-            self.transfers_by_destination[transfer.to_route_id] = []
-        self.transfers_by_destination[transfer.to_route_id].append(
-            (transfer.from_route_id, transfer.from_stop_id, transfer)
-        )
 
     def save(self, path: str):
         """
@@ -202,58 +181,9 @@ class TransferManager:
         key = (route_id, stop_id)
         return self.transfers.get(key, [])
 
-    def get_transfers_to(self, route_id: str) -> list:
-        """
-        Obtiene todas las transferencias que llegan a una ruta.
-
-        Args:
-            route_id: ID de la ruta de destino
-
-        Returns:
-            Lista de tuplas (from_route, from_stop, TransferConnection)
-        """
-        return self.transfers_by_destination.get(route_id, [])
-
-    def get_viable_transfers_from(self, route_id: str, stop_id: str) -> list:
-        """
-        Obtiene solo las transferencias viables desde una parada.
-
-        Args:
-            route_id: ID de la ruta actual
-            stop_id: ID de la parada actual
-
-        Returns:
-            Lista de TransferConnection viables
-        """
-        all_transfers = self.get_transfers_from(route_id, stop_id)
-        return [t for t in all_transfers if t.is_viable()]
-
     def count_transfers(self) -> int:
         """Retorna el número total de transferencias registradas"""
         return sum(len(transfers) for transfers in self.transfers.values())
 
-    def get_statistics(self) -> dict[str, Any]:
-        """
-        Obtiene estadísticas del sistema de transferencias.
-
-        Returns:
-            Diccionario con estadísticas
-        """
-        total = self.count_transfers()
-        viable = sum(1 for transfers in self.transfers.values() for t in transfers if t.is_viable())
-
-        return {
-            "total_transfers": total,
-            "viable_transfers": viable,
-            "viability_rate": viable / total if total > 0 else 0,
-            "routes_with_transfers": len(
-                set(t.from_route_id for transfers in self.transfers.values() for t in transfers)
-            ),
-        }
-
     def __repr__(self):
-        stats = self.get_statistics()
-        return (
-            f"TransferManager({stats['total_transfers']} transfers, "
-            f"{stats['viable_transfers']} viable)"
-        )
+        return f"TransferManager({self.count_transfers()} transfers)"

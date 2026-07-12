@@ -9,7 +9,6 @@ Ejecutar con:
 """
 
 import sys
-import os
 import pytest
 from pathlib import Path
 
@@ -17,14 +16,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-    import pyrosm  # noqa: F401
-    _PYROSM_AVAILABLE = True
+    import osmium  # noqa: F401
+    _OSM_AVAILABLE = True
 except ImportError:
-    _PYROSM_AVAILABLE = False
+    _OSM_AVAILABLE = False
 
 pyrosm_required = pytest.mark.skipif(
-    not _PYROSM_AVAILABLE,
-    reason="pyrosm not installed (requires conda on Windows)"
+    not _OSM_AVAILABLE,
+    reason="osmium not installed"
 )
 
 
@@ -51,17 +50,6 @@ class TestImports:
         from ayatori.models import OSMGraph
         assert OSMGraph is not None
 
-    def test_import_features(self):
-        """Probar importación de build_features."""
-        from ayatori.features import build_features
-        assert build_features is not None
-
-    def test_import_visualization(self):
-        """Probar importación de visualize."""
-        from ayatori.visualization import visualize
-        assert visualize is not None
-
-
 class TestGTFSData:
     """Pruebas para el módulo GTFSData."""
 
@@ -73,7 +61,7 @@ class TestGTFSData:
         # que la clase se puede importar y tiene los métodos esperados
         assert hasattr(GTFSData, 'create_scheduler')
         assert hasattr(GTFSData, 'get_gtfs_data')
-        assert hasattr(GTFSData, 'get_route_graph')
+        assert hasattr(GTFSData, 'get_stop_ids')
 
     def test_gtfs_methods(self):
         """Verificar que los métodos principales existen."""
@@ -84,9 +72,9 @@ class TestGTFSData:
         methods = [
             'create_scheduler',
             'get_gtfs_data',
-            'get_route_graph',
-            'get_route_graph_vertices',
-            'get_route_graph_edges',
+            'get_stop_ids',
+            'get_nearby_stops',
+            'get_stop_coords',
         ]
         
         # Usar inspect en lugar de hasattr
@@ -112,16 +100,11 @@ class TestOSMGraph:
         
         # Obtener métodos de la clase
         methods = [
-            'create_osm_graph',
-            'get_nodes_and_edges',
-            'print_graph',
-            'find_node_by_coordinates',
-            'find_node_by_id',
             'find_nearest_node',
+            'shortest_path',
         ]
-        
-        # Usar inspect en lugar de hasattr
-        members = dict(inspect.getmembers(OSMGraph, predicate=inspect.isfunction))
+
+        members = dict(inspect.getmembers(OSMGraph, predicate=callable))
         for method in methods:
             assert method in members, f"OSMGraph falta método: {method}"
 
@@ -256,65 +239,3 @@ class TestTestData:
         assert pbf.exists()
 
 
-def run_basic_tests():
-    """Ejecutar pruebas sin pytest (para desarrollo rápido)."""
-    print("\n" + "=" * 70)
-    print("EJECUTANDO TESTS BÁSICOS")
-    print("=" * 70 + "\n")
-    
-    test_results = {
-        "passed": 0,
-        "failed": 0,
-        "errors": []
-    }
-    
-    # Importar todos los tests
-    test_classes = [
-        TestImports,
-        TestGTFSData,
-        TestOSMGraph,
-        TestRustworkxUsage,
-        TestDataDirectory,
-        TestConnectionScanAlgorithm,
-        TestTransferConnection,
-        TestTestData,
-    ]
-    
-    for test_class in test_classes:
-        print(f"\n{test_class.__name__}")
-        print("-" * 70)
-        
-        for method_name in dir(test_class):
-            if method_name.startswith('test_'):
-                try:
-                    test_instance = test_class()
-                    method = getattr(test_instance, method_name)
-                    method()
-                    print(f"  ✓ {method_name}")
-                    test_results["passed"] += 1
-                except AssertionError as e:
-                    print(f"  ✗ {method_name}: {str(e)[:50]}")
-                    test_results["failed"] += 1
-                    test_results["errors"].append((method_name, str(e)))
-                except Exception as e:
-                    print(f"  ⚠ {method_name}: {type(e).__name__}: {str(e)[:40]}")
-                    test_results["failed"] += 1
-                    test_results["errors"].append((method_name, str(e)))
-    
-    # Resumen
-    print("\n" + "=" * 70)
-    print(f"RESUMEN: {test_results['passed']} passed, {test_results['failed']} failed")
-    print("=" * 70 + "\n")
-    
-    if test_results["failed"] > 0:
-        print("ERRORES:")
-        for test_name, error in test_results["errors"]:
-            print(f"  {test_name}: {error[:60]}")
-        print()
-    
-    return test_results["failed"] == 0
-
-
-if __name__ == "__main__":
-    success = run_basic_tests()
-    sys.exit(0 if success else 1)

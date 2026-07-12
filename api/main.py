@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
 
                 t0 = _t.time()
                 logger.info("Loading OSM pedestrian graph from %s ...", pbf)
-                osm = OSMGraph.from_file(str(pbf))
+                osm = OSMGraph(str(pbf))
                 logger.info("OSM graph loaded in %.1fs", _t.time() - t0)
             except Exception as e:  # pyrosm ausente / pbf inválido / etc.
                 logger.warning("OSM no disponible (%s); usando Haversine", e)
@@ -146,6 +146,7 @@ async def lifespan(app: FastAPI):
     STATE["tm"] = tm
     STATE["osm"] = osm
     STATE["num_transfers"] = tm.count_transfers()
+    STATE["feed_start"], STATE["feed_end"] = gtfs.feed_date_range()
     yield
     STATE.clear()
 
@@ -182,19 +183,76 @@ def _config_from_override(override: ConfigOverride | None) -> CSAConfig:
     return replace(base, **overrides)
 
 
+def _stop_signature(journey) -> tuple:
+    """Firma de un viaje por sus PARADEROS (ignora qué línea se tomó).
+
+    Dos viajes con la misma secuencia de tramos ``(paradero_subida,
+    paradero_bajada)`` y la misma estructura de caminata/transbordo son "el
+    mismo trayecto": sólo difieren en la línea elegida, que el enriquecimiento de
+    líneas comunes ya expone como opciones del tramo. Sirve para colapsarlos.
+    """
+    sig: list = []
+    for s in journey.segments:
+        t = s.get("type")
+        if t == "transit":
+            sig.append(("T", s.get("from_stop"), s.get("to_stop")))
+        elif t == "transfer":
+            sig.append(("X", s.get("from_stop") or s.get("at_stop"),
+                        s.get("to_stop") or s.get("at_stop")))
+        elif t == "walk":
+            sig.append(("W", s.get("from"), s.get("to")))
+    return tuple(sig)
+
+
+def _collapse_equivalent_journeys(journeys: list) -> list:
+    """Colapsa viajes con idéntica firma de paraderos, conservando el de llegada
+    más temprana. Preserva el orden de aparición del primer representante."""
+    rep: dict[tuple, Any] = {}
+    order: list[tuple] = []
+    for j in journeys:
+        sig = _stop_signature(j)
+        prev = rep.get(sig)
+        if prev is None:
+            rep[sig] = j
+            order.append(sig)
+        elif j.arrival_time < prev.arrival_time:
+            rep[sig] = j
+    return [rep[sig] for sig in order]
+
+
 def _run_plan(req_origin, req_destination, req_departure, profile, num_alternatives, csa_config):
     gtfs = STATE["gtfs"]
     tm = STATE["tm"]
-    csa = ConnectionScanAlgorithm(
-        gtfs, transfer_manager=tm, config=csa_config, osm_graph=STATE.get("osm")
-    )
-    journeys = csa.find_journey(
-        origin_coords=tuple(req_origin),
-        destination_coords=tuple(req_destination),
-        departure_time=req_departure,
-        num_alternatives=num_alternatives,
-        profile=profile,
-    )
+
+    def _search(cfg):
+        csa = ConnectionScanAlgorithm(
+            gtfs, transfer_manager=tm, config=cfg, osm_graph=STATE.get("osm")
+        )
+        return csa.find_journey(
+            origin_coords=tuple(req_origin),
+            destination_coords=tuple(req_destination),
+            departure_time=req_departure,
+            num_alternatives=num_alternatives,
+            profile=profile,
+        )
+
+    journeys = _search(csa_config)
+    if not journeys:
+        # Fallback: una parada en zona de baja densidad puede quedar apenas
+        # fuera del presupuesto de caminata. Reintentar una vez ampliándolo
+        # antes de devolver "sin viajes".
+        widened = replace(
+            csa_config,
+            max_walking_to_stop_km=min(csa_config.max_walking_to_stop_km * 2, 5.0),
+            max_total_walking_km=min(
+                max(csa_config.max_total_walking_km, csa_config.max_walking_to_stop_km * 2 + 1.0),
+                10.0,
+            ),
+        )
+        journeys = _search(widened)
+    # "Mismo trayecto, distinta línea" → un solo viaje; las líneas alternativas
+    # del tramo se exponen como route_options en journey_to_dto.
+    journeys = _collapse_equivalent_journeys(journeys)
     return [journey_to_dto(j, gtfs) for j in journeys]
 
 
@@ -212,12 +270,9 @@ def health():
         num_routes=len(gtfs.route_stops) if gtfs else 0,
         num_stops=len(gtfs.stops) if gtfs else 0,
         num_transfers=STATE.get("num_transfers", 0),
+        feed_start=STATE.get("feed_start"),
+        feed_end=STATE.get("feed_end"),
     )
-
-
-@app.get("/config/defaults")
-def config_defaults():
-    return asdict(CSAConfig())
 
 
 @app.get("/config/schema")
@@ -237,35 +292,18 @@ def config_schema():
         "time_horizon_hours": {"min": 0.5, "max": 12.0, "step": 0.5},
         "max_origin_stops": {"min": 1, "max": 30, "step": 1},
         "max_destination_stops": {"min": 1, "max": 30, "step": 1},
-        "fallback_step_minutes": {"min": 0.5, "max": 30.0, "step": 0.5},
     }
     from .schemas import KNOWN_MODES
 
-    mode_list_fields = {"allowed_modes", "excluded_modes"}
-    mode_map_fields = {
-        "mode_transfer_penalty_seconds",
-        "mode_preference_weight",
-        "mode_access_walk_km",
-    }
+    # Sólo ofrecer modos que existen en el feed cargado; si el GTFS aún no está
+    # disponible, caer a la lista canónica completa.
+    gtfs = STATE.get("gtfs")
+    mode_options = gtfs.available_modes() if gtfs is not None else list(KNOWN_MODES)
 
-    out: dict = {}
-    for f in fields(CSAConfig()):
-        name = f.name
-        entry: dict = {"default": defaults[name]}
-        if name in bounds:
-            entry["kind"] = "number"
-            entry.update(bounds[name])
-        elif name in mode_list_fields:
-            entry["kind"] = "modes"
-            entry["options"] = list(KNOWN_MODES)
-        elif name in mode_map_fields:
-            entry["kind"] = "mode_map"
-            entry["options"] = list(KNOWN_MODES)
-        elif isinstance(defaults[name], bool):
-            entry["kind"] = "bool"
-        else:
-            entry["kind"] = "other"
-        out[name] = entry
+    # El frontend (config.js) sólo lee min/max/step/default por slider y
+    # allowed_modes.options; no emitimos metadata que nadie consume.
+    out: dict = {name: {"default": defaults[name], **b} for name, b in bounds.items()}
+    out["allowed_modes"] = {"default": defaults["allowed_modes"], "options": list(mode_options)}
     return out
 
 
@@ -319,7 +357,6 @@ async def geocode(
     params = {
         "q": q,
         "format": "json",
-        "addressdetails": 0,
         "limit": limit,
         "countrycodes": countrycodes,
     }
@@ -340,7 +377,6 @@ async def geocode(
             lat=float(d["lat"]),
             lon=float(d["lon"]),
             type=d.get("type"),
-            importance=d.get("importance"),
         )
         for d in data
     ]

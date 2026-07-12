@@ -89,3 +89,7 @@ mapa_*.html
 # IDE
 .vscode/
 .idea/
+
+reports/
+informe final/
+docs/

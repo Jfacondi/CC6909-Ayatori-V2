@@ -1,0 +1,224 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   Ayatori — Design tokens
+   Sistema de diseño sin build. Variables CSS semánticas + temas claro/oscuro.
+   El tema sigue prefers-color-scheme y se puede forzar con [data-theme].
+   ───────────────────────────────────────────────────────────────────────── */
+
+@layer tokens, base, components, utilities;
+
+@layer tokens {
+  :root {
+    /* Tipografía */
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+                 Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    /* Escala tipográfica (modular ~1.2) */
+    --text-2xs: 10px;
+    --text-xs: 11px;
+    --text-sm: 12px;
+    --text-md: 13px;
+    --text-base: 14px;
+    --text-lg: 16px;
+    --text-xl: 19px;
+    --text-2xl: 23px;
+    --leading-tight: 1.25;
+    --leading-normal: 1.5;
+
+    /* Pesos */
+    --weight-normal: 400;
+    --weight-medium: 500;
+    --weight-semibold: 600;
+    --weight-bold: 700;
+
+    /* Espaciado (base 4px) */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 20px;
+    --space-6: 24px;
+    --space-8: 32px;
+    --space-10: 40px;
+
+    /* Radios */
+    --radius-sm: 4px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius-full: 999px;
+
+    /* Sombras */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.18);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.28);
+    --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.40);
+
+    /* Z-index nombrados */
+    --z-map: 0;
+    --z-overlay: 400;
+    --z-legend: 500;
+    --z-sheet: 700;
+    --z-dropdown: 1000;
+    --z-toast: 1200;
+
+    /* Transiciones (se anulan con prefers-reduced-motion) */
+    --dur-fast: 120ms;
+    --dur-base: 200ms;
+    --dur-slow: 320ms;
+    --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+    /* Color de modo — paleta Okabe-Ito (segura para daltonismo). */
+    --mode-bus: #0072b2;
+    --color-walk: #e69f00;
+    --color-transfer: #cc79a7;
+  }
+
+  /* ── Tema oscuro (default) ─────────────────────────────────────────────── */
+  :root,
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0b1120;
+    --surface: #131c31;
+    --surface-2: #1e293b;
+    --surface-3: #334155;
+    --surface-hover: #3b4a61;
+    --border: #2c3a52;
+    --border-strong: #475569;
+
+    --text: #e8eef7;
+    --text-muted: #97a4b8;
+    --text-faint: #6b7891;
+    --on-primary: #06121f;
+
+    --primary: #38bdf8;
+    --primary-strong: #0ea5e9;
+    --primary-soft: rgba(56, 189, 248, 0.14);
+    --accent: #a78bfa;
+
+    --success: #4ade80;
+    --success-soft: rgba(74, 222, 128, 0.14);
+    --warning: #fbbf24;
+    --warning-soft: rgba(251, 191, 36, 0.14);
+    --danger: #f87171;
+    --danger-soft: rgba(248, 113, 113, 0.16);
+
+    /* Atenúa el basemap raster para que no choque con la UI oscura. */
+    --map-tile-filter: brightness(0.65) contrast(1.05) saturate(0.9);
+    --scrim: rgba(2, 6, 16, 0.6);
+  }
+
+  /* ── Tema claro ────────────────────────────────────────────────────────── */
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #eef2f7;
+    --surface: #ffffff;
+    --surface-2: #f4f6fb;
+    --surface-3: #e6eaf2;
+    --surface-hover: #dde4ef;
+    --border: #d7deea;
+    --border-strong: #b8c2d4;
+
+    --text: #16202e;
+    --text-muted: #5a6678;
+    --text-faint: #8a94a6;
+    --on-primary: #ffffff;
+
+    --primary: #0284c7;
+    --primary-strong: #0369a1;
+    --primary-soft: rgba(2, 132, 199, 0.12);
+    --accent: #7c3aed;
+
+    --success: #16a34a;
+    --success-soft: rgba(22, 163, 74, 0.12);
+    --warning: #b45309;
+    --warning-soft: rgba(180, 83, 9, 0.12);
+    --danger: #dc2626;
+    --danger-soft: rgba(220, 38, 38, 0.10);
+
+    --map-tile-filter: none;
+    --scrim: rgba(15, 23, 42, 0.35);
+  }
+
+  /* Cuando no hay override manual, respetar la preferencia del sistema. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+      color-scheme: light;
+      --bg: #eef2f7;
+      --surface: #ffffff;
+      --surface-2: #f4f6fb;
+      --surface-3: #e6eaf2;
+      --surface-hover: #dde4ef;
+      --border: #d7deea;
+      --border-strong: #b8c2d4;
+      --text: #16202e;
+      --text-muted: #5a6678;
+      --text-faint: #8a94a6;
+      --on-primary: #ffffff;
+      --primary: #0284c7;
+      --primary-strong: #0369a1;
+      --primary-soft: rgba(2, 132, 199, 0.12);
+      --accent: #7c3aed;
+      --success: #16a34a;
+      --success-soft: rgba(22, 163, 74, 0.12);
+      --warning: #b45309;
+      --warning-soft: rgba(180, 83, 9, 0.12);
+      --danger: #dc2626;
+      --danger-soft: rgba(220, 38, 38, 0.10);
+      --map-tile-filter: none;
+      --scrim: rgba(15, 23, 42, 0.35);
+    }
+  }
+}
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1, h2, h3 { margin: 0; font-weight: var(--weight-semibold); }
+
+  button { font-family: inherit; }
+
+  /* Foco visible y consistente para navegación por teclado. */
+  :focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+  :focus:not(:focus-visible) { outline: none; }
+
+  /* Scrollbars discretas */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: var(--radius-full);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

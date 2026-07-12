@@ -27,18 +27,22 @@ Capa FastAPI sobre el motor `ConnectionScanAlgorithm`. Carga GTFS + transferenci
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
+> El `~10-30s` del paso 1 corresponde al feed por defecto 2023; con el feed 2026 (`GTFS_20260425_v3`) el parseo del feed toma del orden de minutos (~3–6 min).
+
 ## Endpoints
 
 ### `GET /health`
 
 ```json
-{ "status": "ok", "gtfs_loaded": true, "num_routes": 427,
-  "num_stops": 12211, "num_transfers": 869470 }
+{ "status": "ok", "gtfs_loaded": true, "num_routes": 425,
+  "num_stops": 12279, "num_transfers": 1462440 }
 ```
 
-### `GET /config/defaults`
+> Cifras con el feed 2026 (`GTFS_20260425_v3`); con el feed por defecto 2023-09-16 son menores (~427 / ~12.211 / ~869 k).
 
-Devuelve `CSAConfig()` serializado. Útil para inicializar formularios.
+### `GET /geocode?q=`
+
+Proxy a Nominatim (con cache en memoria) para autocompletar direcciones. Devuelve una lista de candidatos `{ display_name, lat, lon }`.
 
 ### `GET /config/schema`
 
@@ -95,4 +99,27 @@ FastAPI genera documentación interactiva en `/docs`. Probar `POST /plan` desde 
 
 ## Frontend
 
-Servido desde `/` (estático en `api/static/`). No tiene build step — `index.html` carga Leaflet desde CDN y `/static/app.js` directo. Para modificar la UI, editar esos dos archivos.
+Servido desde `/` (estático en `api/static/`). **Sin build step**: `index.html` carga Leaflet desde CDN y la app como ES modules nativos (`<script type="module" src="/static/js/main.js">`). Estructura:
+
+```
+api/static/
+  index.html            estructura + sprite SVG de iconos
+  css/
+    tokens.css          design tokens (color, espaciado, tipografía) + temas claro/oscuro
+    components.css       botones, chips, cards, toasts, sliders, dropdown…
+    layout.css           shell responsive (sidebar ↔ bottom sheet) y vistas
+  js/
+    main.js              punto de entrada: carga estado y cablea eventos
+    api.js               wrappers de fetch a la API
+    state.js             estado compartido
+    map.js               Leaflet: marcadores, dibujo de viajes, leyenda
+    geocoder.js          autocompletado de direcciones (teclado + ARIA)
+    results.js           tarjetas, ribbons, badges, timeline, tabla comparativa
+    config.js            sliders avanzados, modos, perfiles
+    compare.js           variantes del modo comparar
+    permalink.js         estado del viaje en la URL (compartir/reproducir)
+    format.js, coords.js, dom.js   utilidades puras
+    ui/{toast,theme,sheet}.js      componentes de UI
+```
+
+Diseño mobile-first y accesible (WCAG AA): navegación por teclado, ARIA, foco visible, `prefers-color-scheme` y `prefers-reduced-motion`.

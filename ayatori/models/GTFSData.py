@@ -6,14 +6,11 @@ import os
 import warnings
 import zipfile
 from collections import defaultdict
-from datetime import datetime, time, timedelta
+from itertools import pairwise
 from math import asin, cos, radians, sin, sqrt
 
-import folium
 import numpy as np
-import pandas as pd
 import pygtfs
-import rustworkx as rx
 from scipy.spatial import cKDTree
 
 from ..utils.gtfs_cleaner import clean_gtfs_stops
@@ -31,10 +28,8 @@ class GTFSData:
 
     Attributes:
         scheduler: ``pygtfs.Schedule`` con el feed cargado.
-        route_stops: ``{route_id: {stop_id: {sequence, coordinates, arrival_times}}}``.
+        route_stops: ``{route_id: {stop_id: {sequence, coordinates, trips_here}}}``.
         stops: conjunto de stop_ids vistos en alguna ruta.
-        special_dates: feriados / excepciones del calendar.
-        graphs: ``{route_id: rustworkx.PyDiGraph}`` por ruta.
         transfer_manager: presente después de ``get_or_compute_transfers``.
 
     Example:
@@ -54,11 +49,7 @@ class GTFSData:
 
         self.scheduler = self.create_scheduler(GTFS_PATH)
         _tick("create_scheduler")
-        self.graphs = {}
-        self._graph_node_maps = {}  # {route_id: {stop_id: rx_idx}}
-        self._graph_idx_to_node = {}  # {route_id: {rx_idx: stop_id}}
         self.route_stops = {}
-        self.special_dates = []
         self.stops = set()
         self.route_meta: dict = {}  # {route_id: {route_type, agency, names, mode}}
         self.stop_names: dict = {}  # {stop_id: stop_name}
@@ -80,7 +71,7 @@ class GTFSData:
         self.trip_service: dict = {}
         self.trip_route: dict = {}
         self.trip_dispatches: dict = {}
-        self.graphs, self.route_stops, self.special_dates = self.get_gtfs_data()
+        self.get_gtfs_data()  # puebla route_stops y los índices por trip
         _tick("get_gtfs_data")
         self._expand_frequencies()
         _tick("expand_frequencies")
@@ -96,27 +87,6 @@ class GTFSData:
         _tick("build_route_meta")
         self._build_calendar_index()
         _tick("build_calendar_index")
-
-    @staticmethod
-    def _orientation_from_trip(trip) -> str:
-        """Orientación canónica ("I" ida / "R" retorno) de un trip.
-
-        Prefiere ``direction_id`` (columna GTFS estándar, 0=outbound, 1=inbound).
-        Cae al parse legacy ``trip_id.split("-")[1]`` del feed antiguo de Red
-        Metropolitana (formato ``XXX-{I|R}-Z-BNN``) solo si direction_id no
-        viene. Los trips de Metro del feed 2026 usan ``DF_L1_..._V1`` sin
-        dashes y solo son ruteables vía direction_id.
-        """
-        dir_id = getattr(trip, "direction_id", None)
-        if dir_id is not None and dir_id != "":
-            try:
-                return "I" if int(dir_id) == 0 else "R"
-            except (ValueError, TypeError):
-                pass
-        parts = (getattr(trip, "trip_id", None) or "").split("-")
-        if len(parts) >= 2:
-            return parts[1]
-        return "I"
 
     def _build_spatial_index(self):
         """Construye un índice espacial para búsquedas rápidas de paradas.
@@ -189,11 +159,7 @@ class GTFSData:
             if headway <= 0 or end <= start:
                 continue
 
-            dispatches = expanded.setdefault(tid, [])
-            t = start
-            while t < end:
-                dispatches.append(t)
-                t += headway
+            expanded.setdefault(tid, []).extend(range(start, end, headway))
 
         # Sobreescribir solo los trips con frequencies (preserva el dispatch único
         # de los demás). Ordenar para garantizar invariante.
@@ -207,7 +173,6 @@ class GTFSData:
           - _stop_to_routes: {stop_id: [route_id, ...]}  → O(1) por parada
           - _sorted_route_stops: {route_id: [(stop_id, stop_info), ...]} ordenado por secuencia
           - _stop_coords: {stop_id: (lon, lat)}  → O(1) lookup de coordenadas
-          - arrival_times de cada parada se pre-ordenan una sola vez aquí
           - trips_here por (route, stop): índice ligero {trip_id, offset_at_stop}
             que el CSA usa para construir boardings absolutos *bajo demanda*
             (expandiendo dispatches). Materializar todos los boardings al
@@ -225,13 +190,6 @@ class GTFSData:
                     coords = stop_info.get("coordinates")
                     if coords:
                         self._stop_coords[stop_id] = coords
-                arrival_times = stop_info.get("arrival_times")
-                if arrival_times:
-                    arrival_times.sort()
-                by_service = stop_info.get("arrival_times_by_service")
-                if by_service:
-                    for times in by_service.values():
-                        times.sort()
                 stop_info["trips_here"] = []
 
             self._sorted_route_stops[route_id] = sorted(
@@ -255,6 +213,23 @@ class GTFSData:
                 if stop_info is None:
                     continue
                 stop_info["trips_here"].append((trip_id, offset_secs))
+
+        # Completar coords de paradas presentes en el feed pero ausentes de
+        # route_stops (entradas de Metro, pathway nodes, paraderos sin servicio).
+        # Esto se hace UNA vez al arranque, en el hilo que creó el scheduler
+        # SQLite — así get_stop_coords nunca consulta la DB en tiempo de request
+        # (la sesión SQLite de pygtfs no es válida fuera de su hilo de origen, y
+        # los endpoints síncronos de FastAPI corren en otro hilo del threadpool).
+        for stop in self.scheduler.stops:
+            stop_id = stop.stop_id
+            if stop_id in self._stop_coords:
+                continue
+            if stop.stop_lon is None or stop.stop_lat is None:
+                continue
+            try:
+                self._stop_coords[stop_id] = (float(stop.stop_lon), float(stop.stop_lat))
+            except (ValueError, TypeError):
+                continue
 
     def _build_shape_index(self):
         """Indexa shapes.txt para trazar polylines reales de cada ruta.
@@ -378,6 +353,15 @@ class GTFSData:
         meta = self.route_meta.get(route_id)
         return meta["mode"] if meta else "bus"
 
+    def available_modes(self) -> list[str]:
+        """Modos canónicos presentes en el feed, en orden de ``route_type``.
+
+        Útil para la UI: sólo tiene sentido ofrecer filtros para modos que
+        existen realmente en el GTFS cargado.
+        """
+        present = {meta["mode"] for meta in self.route_meta.values()}
+        return [m for m in self._ROUTE_TYPE_TO_MODE.values() if m in present]
+
     def get_stop_name(self, stop_id: str) -> str | None:
         """Nombre legible de una parada, o None si no se conoce."""
         return self.stop_names.get(stop_id)
@@ -388,8 +372,6 @@ class GTFSData:
         - ``self.services[service_id] = {"weekdays": (lun..dom bool), "start", "end"}``
         - ``self.service_exceptions[service_id] = [(date, exception_type), ...]``
           donde exception_type 1=agrega servicio, 2=lo quita ese día.
-
-        ``special_dates`` se mantiene intacto (compat de ``is_holiday``).
         """
         self.services: dict = {}
         self.service_exceptions: dict = defaultdict(list)
@@ -461,6 +443,26 @@ class GTFSData:
         self._active_svc_cache[query_date] = result
         return result
 
+    def feed_date_range(self) -> tuple[str | None, str | None]:
+        """Rango ``[start, end]`` de fechas con servicio en el feed (ISO).
+
+        Combina los rangos de ``calendar.txt`` con las fechas de
+        ``calendar_dates.txt``. Devuelve ``(None, None)`` si no hay calendario.
+        """
+        starts, ends = [], []
+        for c in getattr(self, "services", {}).values():
+            if c.get("start") is not None:
+                starts.append(c["start"])
+            if c.get("end") is not None:
+                ends.append(c["end"])
+        for exs in getattr(self, "service_exceptions", {}).values():
+            for d, _etype in exs:
+                starts.append(d)
+                ends.append(d)
+        if not starts or not ends:
+            return None, None
+        return min(starts).isoformat(), max(ends).isoformat()
+
     def get_route_shape_segment(
         self, route_id: str, from_stop: str, to_stop: str
     ) -> list[list[float]] | None:
@@ -516,7 +518,25 @@ class GTFSData:
         if idx_to - idx_from < 1:
             return None
 
-        return shape[idx_from : idx_to + 1].tolist()
+        seg = shape[idx_from : idx_to + 1]
+        # Guard contra avenidas de doble sentido: el shape pasa dos veces cerca de
+        # una parada y argmin puede latchear en la pasada equivocada, haciendo que
+        # el recorte abarque casi toda la ruta (la "forma rara" en el mapa: un tramo
+        # de 240 m dibujado como 30 km). Si el arco resulta absurdamente más largo
+        # que la distancia recta entre paradas, descartar el shape y caer al render
+        # lineal del tramo (get_route_stops_segment / línea recta).
+        # ponytail: heurístico simple; el fix exhaustivo sería proyección monotónica
+        # de todas las paradas sobre el shape (más código + cache por ruta/dirección).
+        diffs = np.diff(seg, axis=0)
+        arc_km = float(
+            np.sqrt(diffs[:, 0] ** 2 + (diffs[:, 1] * np.cos(np.radians(from_lat))) ** 2).sum()
+            * 111.0
+        )
+        straight_km = self.haversine(from_lon, from_lat, to_lon, to_lat)
+        if arc_km > max(0.4, 4.0 * straight_km):
+            return None
+
+        return seg.tolist()
 
     def get_route_stops_segment(
         self, route_id: str, from_stop: str, to_stop: str
@@ -624,7 +644,7 @@ class GTFSData:
                 continue
 
             polyline: list[list[float]] = []
-            for a, b in zip(coords[:-1], coords[1:]):
+            for a, b in pairwise(coords):
                 seg = None
                 dist_km = self.haversine(a[1], a[0], b[1], b[0])
                 if dist_km <= max_pair_km:
@@ -775,6 +795,22 @@ class GTFSData:
         logging.getLogger("pygtfs").setLevel(logging.ERROR)
         warnings.filterwarnings("ignore")
 
+        # Cache SQLite persistente junto al feed: parsear CSV→SQLite cuesta
+        # minutos y es determinístico para un zip dado. Si el sidecar existe y
+        # es más nuevo que el feed, se abre directo sin re-parsear. Un feed
+        # nuevo (mtime mayor) invalida el cache automáticamente.
+        db_path = str(GTFS_PATH) + ".sqlite"
+        try:
+            if os.path.exists(db_path) and os.path.getmtime(db_path) >= os.path.getmtime(
+                str(GTFS_PATH)
+            ):
+                scheduler = pygtfs.Schedule(db_path)
+                if scheduler.routes:  # DB vacía/corrupta → reconstruir abajo
+                    print(f"GTFS cargado desde cache SQLite: {db_path}")
+                    return scheduler
+        except Exception as e:
+            print(f"Cache SQLite inválido ({e}), re-parseando feed...")
+
         # Pre-limpieza proactiva: el feed 2026 trae stops sin coords (pathway
         # nodes, entradas) que pygtfs descarta loggeando ERROR pero sin lanzar
         # excepción. Detectamos eso peek-eando stops.txt y limpiamos antes de
@@ -790,22 +826,44 @@ class GTFSData:
 
         # Intentar cargar GTFS (ya limpiado si correspondía)
         try:
-            scheduler = pygtfs.Schedule(":memory:")
-            pygtfs.append_feed(scheduler, str(gtfs_to_use))
-            return scheduler
+            return self._parse_feed(gtfs_to_use, db_path)
         except (TypeError, ValueError) as e:
             # Fallback: si aún falla por coordenadas None, reintentar con cleaner
             # (cubre el caso en que la pre-limpieza no se ejecutó por algún motivo).
             if "float()" in str(e) and "NoneType" in str(e):
+                gtfs_to_use = clean_gtfs_stops(GTFS_PATH)
+                return self._parse_feed(gtfs_to_use, db_path)
+            raise
+
+    @staticmethod
+    def _parse_feed(feed_path, db_path):
+        """Parsea el feed en un SQLite persistente; si el disco falla, en memoria."""
+        try:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+            scheduler = pygtfs.Schedule(db_path)
+        except Exception:
+            # Directorio de solo lectura, lock, etc. → sin cache, igual que antes.
+            scheduler = pygtfs.Schedule(":memory:")
+            db_path = None
+        try:
+            pygtfs.append_feed(scheduler, str(feed_path))
+        except Exception:
+            # No dejar un .sqlite a medio escribir que un arranque futuro
+            # confunda con un cache válido. En Windows hay que cerrar la
+            # conexión antes de poder borrar el archivo.
+            if db_path:
                 try:
-                    gtfs_to_use = clean_gtfs_stops(GTFS_PATH)
-                    scheduler = pygtfs.Schedule(":memory:")
-                    pygtfs.append_feed(scheduler, str(gtfs_to_use))
-                    return scheduler
+                    scheduler.session.close()
+                    scheduler.engine.dispose()
                 except Exception:
-                    raise
-            else:
-                raise
+                    pass
+                try:
+                    os.remove(db_path)
+                except OSError:
+                    pass
+            raise
+        return scheduler
 
     def get_gtfs_data(self):
         """
@@ -813,32 +871,27 @@ class GTFSData:
         the transit feed data of Santiago's public transport, including "Red Metropolitana de Movilidad" (previously known
         as Transantiago), "Metro de Santiago", "EFE Trenes de Chile", and "Buses de Acercamiento Aeropuerto".
 
-        Returns:
-            graphs: GTFS data converted to a dictionary of graphs, one per route.
-            route_stops: Dictionary containing the stops for each route.
-            special_dates: List of special calendar dates.
+        Puebla ``self.route_stops`` y los índices por trip (``trips``,
+        ``trip_stop_idx``, ``trip_service``, ``trip_route``, ``trip_dispatches``).
         """
         sched = self.scheduler
 
-        # Get special calendar dates
-        for cal_date in sched.service_exceptions:  # Calendar_dates is renamed in pygtfs
-            self.special_dates.append(cal_date.date.strftime("%d/%m/%Y"))
+        # Una sola pasada por trips y stops. Iterar ``sched.trips`` re-consulta
+        # SQLite y materializa ~todos los objetos ORM cada vez; hacerlo dentro
+        # del loop de rutas era O(rutas × trips) (~10M materializaciones).
+        # ``stops_by_id(...)`` era además una query SQL por parada.
+        trips_by_route: dict = defaultdict(list)
+        for trip in sched.trips:
+            trips_by_route[trip.route_id].append(trip)
+        stops_by_id = {stop.stop_id: stop for stop in sched.stops}
 
-        stop_id_map = {}  # To assign unique ids to every stop
         stop_coords = {}
 
         for route in sched.routes:
-            graph = rx.PyDiGraph()
-            node_map = {}  # {stop_id: rx_idx}
-            idx_to_node = {}  # {rx_idx: stop_id}
-            stop_ids = set()
-            trips = [trip for trip in sched.trips if trip.route_id == route.route_id]
-
-            added_edges = set()  # To keep track of the edges that have already been added
+            trips = trips_by_route.get(route.route_id, [])
 
             for trip in trips:
                 stop_times = trip.stop_times
-                orientation = self._orientation_from_trip(trip)
                 service_id = getattr(trip, "service_id", None)
 
                 # Índice por trip: el CSA necesita la secuencia completa del trip
@@ -871,148 +924,40 @@ class GTFSData:
                 # _expand_frequencies sobreescribe esto para trips con frecuencias.
                 self.trip_dispatches[trip.trip_id] = [first_secs]
 
-                for i in range(len(stop_times)):
-                    stop_id = stop_times[i].stop_id
-                    sequence = stop_times[i].stop_sequence
+                # Registrar paradas de la ruta (todas menos la última del trip:
+                # la última no permite avanzar). Sin arrival_times: el CSA usa
+                # trips_here + trip_dispatches; los viejos arrays de datetime.time
+                # (millones de objetos, ordenados al arranque) no tenían lector.
+                for st in sorted_st[:-1]:
+                    stop_id = st.stop_id
+                    if route.route_id not in stop_coords:
+                        stop_coords[route.route_id] = {}
+                    if stop_id in stop_coords[route.route_id]:
+                        continue
 
-                    if stop_id not in stop_id_map:
-                        vertex = stop_id  # Use stop_id directly as node identifier
-                        stop_id_map[stop_id] = vertex
-                    else:
-                        vertex = stop_id_map[stop_id]
+                    stop = stops_by_id.get(stop_id)
+                    if stop is None or stop.stop_lat is None or stop.stop_lon is None:
+                        continue  # Saltar paradas sin coordenadas
+                    try:
+                        lat = float(stop.stop_lat)
+                        lon = float(stop.stop_lon)
+                    except (ValueError, TypeError):
+                        continue  # Saltar paradas con coordenadas inválidas
+                    # Validar rango geográfico
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        continue
 
-                    stop_ids.add(vertex)
-                    # Add node to graph if it doesn't exist
-                    if vertex not in node_map:
-                        idx = graph.add_node({"stop_id": stop_id})
-                        node_map[vertex] = idx
-                        idx_to_node[idx] = vertex
-
-                    if i < len(stop_times) - 1:
-                        next_stop_id = stop_times[i + 1].stop_id
-
-                        if next_stop_id not in stop_id_map:
-                            next_vertex = next_stop_id
-                            stop_id_map[next_stop_id] = next_vertex
-                        else:
-                            next_vertex = stop_id_map[next_stop_id]
-
-                        edge = (vertex, next_vertex)
-                        if edge not in added_edges:  # Check if the edge has already been added
-                            if next_vertex not in node_map:
-                                next_idx = graph.add_node({"stop_id": next_stop_id})
-                                node_map[next_vertex] = next_idx
-                                idx_to_node[next_idx] = next_vertex
-                            graph.add_edge(
-                                node_map[vertex],
-                                node_map[next_vertex],
-                                {"weight": 1, "u": vertex, "v": next_vertex},
-                            )
-                            added_edges.add(edge)  # Add the edge to the set of added edges
-
-                        if route.route_id not in stop_coords:
-                            stop_coords[route.route_id] = {}
-
-                        if stop_id not in stop_coords[route.route_id]:
-                            stop = sched.stops_by_id(stop_id)[0]
-
-                            # Validar que la parada tiene coordenadas válidas
-                            if stop.stop_lat is None or stop.stop_lon is None:
-                                continue  # Saltar paradas sin coordenadas
-
-                            try:
-                                lat = float(stop.stop_lat)
-                                lon = float(stop.stop_lon)
-
-                                # Validar rango geográfico
-                                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                                    continue
-
-                                stop_coords[route.route_id][stop_id] = (lon, lat)
-                            except (ValueError, TypeError):
-                                continue  # Saltar paradas con coordenadas inválidas
-
-                            if route.route_id not in self.route_stops:
-                                self.route_stops[route.route_id] = {}
-
-                            self.route_stops[route.route_id][stop_id] = {
-                                "route_id": route.route_id,
-                                "stop_id": stop_id,
-                                "coordinates": stop_coords[route.route_id][stop_id],
-                                "orientation": "round" if orientation == "I" else "return",
-                                "sequence": sequence,
-                                "arrival_times": [],
-                                "arrival_times_by_service": defaultdict(list),
-                            }
-
-                    arrival_time = (datetime.min + stop_times[i].arrival_time).time()
-
-                    # Solo agregar tiempo de llegada si la parada es válida
-                    if stop_id in self.route_stops.get(route.route_id, {}):
-                        entry = self.route_stops[route.route_id][stop_id]
-                        entry["arrival_times"].append(arrival_time)
-                        if service_id is not None:
-                            entry["arrival_times_by_service"][service_id].append(
-                                arrival_time
-                            )
-
-            self.graphs[route.route_id] = graph
-            self._graph_node_maps[route.route_id] = node_map
-            self._graph_idx_to_node[route.route_id] = idx_to_node
-
-            stops_by_direction = {"round_trip": [], "return_trip": []}
-            for trip in trips:
-                stop_times = trip.stop_times
-                stops = [stop_times[i].stop_id for i in range(len(stop_times))]
-
-                if trip.direction_id == 0:
-                    stops_by_direction["round_trip"].extend(stops)
-                else:
-                    stops_by_direction["return_trip"].extend(stops)
-
-            round_trip_stops = set(stops_by_direction["round_trip"])
-            return_trip_stops = set(stops_by_direction["return_trip"])
-
-            for stop_id in round_trip_stops:
-                if stop_id in stop_coords[route.route_id]:
-                    if stop_id in self.route_stops[route.route_id]:
-                        self.route_stops[route.route_id][stop_id]["orientation"] = "round"
-                    else:
-                        self.route_stops[route.route_id][stop_id] = {
-                            "route_id": route.route_id,
-                            "stop_id": stop_id,
-                            "coordinates": stop_coords[route.route_id][stop_id],
-                            "orientation": "round",
-                            "sequence": sequence,
-                            "arrival_times": [],
-                            "arrival_times_by_service": defaultdict(list),
-                        }
-
-            for stop_id in return_trip_stops:
-                if stop_id in stop_coords[route.route_id]:
-                    if stop_id in self.route_stops[route.route_id]:
-                        self.route_stops[route.route_id][stop_id]["orientation"] = "return"
-                    else:
-                        self.route_stops[route.route_id][stop_id] = {
-                            "route_id": route.route_id,
-                            "stop_id": stop_id,
-                            "coordinates": stop_coords[route.route_id][stop_id],
-                            "orientation": "return",
-                            "sequence": sequence,
-                            "arrival_times": [],
-                            "arrival_times_by_service": defaultdict(list),
-                        }
-
-        for route_id, graph in self.graphs.items():
-            data_dir = "gtfs_routes"
-            if not os.path.exists(data_dir):
-                os.makedirs(data_dir)
-
-            # graph.save(f"{data_dir}/{route_id}.gt")  # Legacy: graph-tool method (not available in networkx)
+                    stop_coords[route.route_id][stop_id] = (lon, lat)
+                    if route.route_id not in self.route_stops:
+                        self.route_stops[route.route_id] = {}
+                    self.route_stops[route.route_id][stop_id] = {
+                        "route_id": route.route_id,
+                        "stop_id": stop_id,
+                        "coordinates": (lon, lat),
+                        "sequence": st.stop_sequence,
+                    }
 
         print("GTFS DATA RECEIVED SUCCESSFULLY")
-
-        return self.graphs, self.route_stops, self.special_dates
 
     def get_stop_ids(self):
         stop_set = set()
@@ -1020,296 +965,6 @@ class GTFSData:
             for stop_id in stops:
                 stop_set.add(stop_id)
         return stop_set
-
-    def get_route_graph(self, route_id):
-        """
-        Given a route_id, returns the vertices and edges for the corresponding graph.
-
-        Parameters:
-        route_id (str): The ID of the route.
-
-        Returns:
-        tuple: A tuple containing the vertices and edges of the graph. The vertices are a list of node IDs, and the edges are a list of tuples containing the source and target node IDs.
-        """
-        if route_id not in self.graphs:
-            print(f"Route {route_id} does not exist.")
-            return None
-
-        graph = self.graphs[route_id]
-        idx_to_node = self._graph_idx_to_node[route_id]
-
-        vertices = []
-        for idx in graph.node_indices():
-            node_id = idx_to_node[idx]
-            if node_id != "" and node_id is not None:
-                vertices.append(node_id)
-
-        edges = []
-        for u_idx, v_idx in graph.edge_list():
-            u = idx_to_node[u_idx]
-            v = idx_to_node[v_idx]
-            if u is not None and v is not None:
-                edges.append((u, v))
-
-        return vertices, edges
-
-    def get_route_graph_vertices(self, route_id):
-        """
-        Given a route_id, returns the vertices for the corresponding graph.
-
-        Parameters:
-        route_id (str): The ID of the route.
-
-        Returns:
-        list: A list containing the vertices of the graph. The vertices are a list of node IDs.
-        """
-        if route_id not in self.graphs:
-            print(f"Route {route_id} does not exist.")
-            return None
-
-        graph = self.graphs[route_id]
-        idx_to_node = self._graph_idx_to_node[route_id]
-        vertices = [idx_to_node[idx] for idx in graph.node_indices()]
-
-        return vertices
-
-    def get_route_graph_edges(self, route_id):
-        """
-        Given a route_id, returns the edges for the corresponding graph.
-
-        Parameters:
-        route_id (str): The ID of the route.
-
-        Returns:
-        list: A list containing the edges of the graph.
-        """
-        if route_id not in self.graphs:
-            print(f"Route {route_id} does not exist.")
-            return None
-
-        graph = self.graphs[route_id]
-        idx_to_node = self._graph_idx_to_node[route_id]
-        edges = [(idx_to_node[u], idx_to_node[v]) for u, v in graph.edge_list()]
-
-        return edges
-
-    def map_route_stops(self, route_list, stops_flag, orientation_flag):
-        """
-        Create a map showing the stops visited on the round trip for the specified routes.
-
-        Parameters:
-        route_list (list): A list of route IDs.
-        stops_flag (bool): A flag indicating whether to display the stops on the map.
-
-        Returns:
-        folium.Map: A map object showing the stops and routes.
-        """
-        # Map the stops visited on the round trip
-        map = folium.Map(location=[-33.45, -70.65], zoom_start=12)
-
-        # List of valid colors
-        map_colors = [
-            "red",
-            "orange",
-            "darkred",
-            "blue",
-            "lightblue",
-            "green",
-            "purple",
-            "lightred",
-            "beige",
-            "darkblue",
-            "darkgreen",
-            "cadetblue",
-            "darkpurple",
-            "white",
-            "pink",
-            "lightgreen",
-            "gray",
-            "black",
-            "lightgray",
-        ]
-
-        color_id = 0
-        for route_id in route_list:
-            # Get the stops for the specified route
-            stops = self.route_stops.get(route_id, {})
-
-            # Filter the stops that are visited on the round trip
-            if orientation_flag:
-                trip_stops = [
-                    stop_info for stop_info in stops.values() if stop_info["orientation"] == "round"
-                ]
-            else:
-                trip_stops = [
-                    stop_info
-                    for stop_info in stops.values()
-                    if stop_info["orientation"] == "return"
-                ]
-
-            # Sort the stops by their sequence number in the trip
-            trip_stops = sorted(trip_stops, key=lambda x: x["sequence"])
-
-            folium.PolyLine(
-                locations=[
-                    [stop_info["coordinates"][1], stop_info["coordinates"][0]]
-                    for stop_info in trip_stops
-                ],
-                color=map_colors[color_id],
-                weight=4,
-            ).add_to(map)
-
-            if stops_flag:
-                for stop_info in trip_stops:
-                    folium.Marker(
-                        location=[stop_info["coordinates"][1], stop_info["coordinates"][0]],
-                        popup=stop_info["stop_id"],
-                        icon=folium.Icon(color="lightgray", icon="minus"),
-                    ).add_to(map)
-
-            color_id += 1
-
-        return map
-
-    def get_route_coordinates(self, route_id):
-        round_trip_stops = []
-        return_trip_stops = []
-        for stop_info in self.route_stops[route_id].values():
-            if stop_info["orientation"] == "round":
-                round_trip_stops.append(stop_info)
-            elif stop_info["orientation"] == "return":
-                return_trip_stops.append(stop_info)
-
-        round_trip_stops.sort(key=lambda stop: stop["sequence"])
-        return_trip_stops.sort(key=lambda stop: stop["sequence"])
-
-        round_trip_coords = [
-            (stop_info["coordinates"][1], stop_info["coordinates"][0])
-            for stop_info in round_trip_stops
-        ]
-        return_trip_coords = [
-            (stop_info["coordinates"][1], stop_info["coordinates"][0])
-            for stop_info in return_trip_stops
-        ]
-
-        return round_trip_coords, return_trip_coords
-
-    def get_near_stop_ids(self, coords, margin):
-        """
-        Given a tuple of coordinates and a margin, returns a list of stop IDs
-        that are within the specified margin of the given coordinates, along with their orientations.
-
-        Parameters:
-        coords (tuple): (lon, lat) of the search center.
-        margin (float): Maximum distance in kilometers.
-
-        Returns:
-        tuple: ([stop_id, ...], [(stop_id, orientation), ...])
-        """
-        lon, lat = coords
-        nearby = self.get_nearby_stops((lat, lon), margin_km=margin)
-
-        stop_ids = []
-        orientations = []
-        seen = set()
-        for stop_id, _ in nearby:
-            if stop_id in seen:
-                continue
-            seen.add(stop_id)
-            stop_ids.append(stop_id)
-            orientation = None
-            for stops_dict in self.route_stops.values():
-                if stop_id in stops_dict:
-                    orientation = stops_dict[stop_id]["orientation"]
-                    break
-            orientations.append((stop_id, orientation))
-        return stop_ids, orientations
-
-    def get_route_stop_ids(self, route_id):
-        """
-        Given a route ID, returns a list of stop IDs for the stops on the given route.
-
-        Parameters:
-        route_id (int): The ID of the route to get the stops for.
-
-        Returns:
-        list: A list of stop IDs for the stops on the given route.
-        """
-        return list(self.route_stops.get(route_id, {}).keys())
-
-    def route_stop_matcher(self, route_id, stop_id):
-        """
-        Given a route ID, and a stop ID, returns True if the stop ID is on the given route,
-        and False otherwise.
-
-        Parameters:
-        route_id (int): The ID of the route to check.
-        stop_id (int): The ID of the stop to check.
-
-        Returns:
-        bool: True if the stop ID is on the given route, False otherwise.
-        """
-        stop_list = self.get_route_stop_ids(route_id)
-        return stop_id in stop_list
-
-    def is_route_near_coordinates(self, route_id, coordinates, margin):
-        """
-        Given a route ID, a tuple of coordinates, and a margin, returns True if the route
-        has a stop within the specified margin of the given coordinates, and False otherwise.
-
-        Parameters:
-        route_id (int): The ID of the route to check.
-        coordinates (tuple): A tuple of two floats representing the longitude and latitude of the coordinates to search around.
-        margin (float): The maximum distance (in kilometers) from the given coordinates to include stops in the result.
-
-        Returns:
-        bool: True if the route has a stop within the specified margin of the given coordinates, False otherwise.
-        """
-        for stop_info in self.route_stops[route_id].values():
-            stop_coords = stop_info["coordinates"]
-            distance = self.haversine(
-                coordinates[1], coordinates[0], stop_coords[1], stop_coords[0]
-            )
-            if distance <= margin:
-                return route_id
-        return False
-
-    def get_bus_orientation(self, route_id, stop_id):
-        """
-        Checks and confirms the bus orientation, while visiting a stop, in the GTFS data files.
-
-        Parameters:
-        route_id (str): The route or service's ID to check.
-        stop_id (str): The visited stop ID.
-
-        Returns:
-        str or list: The bus orientation(s) associated with the route_id and stop_id. None if nothing is found.
-        """
-        stop_times = pd.read_csv("stop_times.txt")
-        filtered_stop_times = stop_times[
-            (stop_times["trip_id"].str.startswith(route_id)) & (stop_times["stop_id"] == stop_id)
-        ]
-
-        orientations = []
-        for trip_id in filtered_stop_times["trip_id"]:
-            # Fallback al parse legacy del trip_id; el feed 2026 usa
-            # direction_id pero esta función legacy no recibe el objeto
-            # trip de pygtfs, sólo el trip_id, así que no puede leerlo.
-            parts = str(trip_id).split("-")
-            if len(parts) < 2:
-                continue
-            orientation = parts[1]
-            if orientation == "I" and "round" not in orientations:
-                orientations.append("round")
-            elif orientation == "R" and "return" not in orientations:
-                orientations.append("return")
-
-        if len(orientations) == 0:
-            return None
-        elif len(set(orientations)) == 1:
-            return orientations[0]
-        else:
-            return orientations
 
     def connection_finder(self, stop_id_1, stop_id_2):
         """
@@ -1338,333 +993,210 @@ class GTFSData:
         """
         return list(self._stop_to_routes.get(stop_id, []))
 
-    def is_24_hour_service(self, route_id):
+    # ────────────────────────────────────────────────────────────────────────
+    # Líneas comunes (common lines) — opciones de recorrido sobre un mismo tramo
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _next_departure_secs(
+        self,
+        route_id: str,
+        stop_id: str,
+        after_secs: int,
+        active_services: frozenset = frozenset(),
+    ) -> int | None:
+        """Próxima salida (segundos desde medianoche) de ``route_id`` en
+        ``stop_id`` en/después de ``after_secs``.
+
+        Reusa la misma fuente que el CSA para abordajes: ``trips_here`` (trips de
+        la ruta que pasan por la parada, con su offset) + ``trip_dispatches``
+        (despachos absolutos expandidos de frequencies.txt) + ``trip_service``.
+        Si ``active_services`` no está vacío, filtra por el ``service_id`` del
+        trip (líneas que operan ese día). Devuelve ``None`` si la ruta no tiene
+        ninguna salida válida desde esa parada (incluido el caso de que no haya
+        datos de horario para ella).
+
+        No aplica módulo a 24 h: los despachos son absolutos desde medianoche, lo
+        que deja que una salida pasada la medianoche (p.ej. 24:10) siga siendo
+        comparable contra una ventana nocturna sin envolver.
         """
-        Determines if the given route has a 24-hour service.
-
-        Parameters:
-        route_id (str): A string representing the ID of the route.
-
-        Returns:
-        bool: True if the route has a 24-hour service, False otherwise.
-        """
-        # Read the frequencies for the route
-        frequencies = pd.read_csv("frequencies.txt")
-        route_str = str(route_id) + "-"
-        route_frequencies = frequencies[frequencies["trip_id"].str.startswith(route_str)]
-
-        # Check if any frequency has a start time of "00:00:00" and an end time of "24:00:00"
-        has_start_time = False
-        has_end_time = False
-        for _, row in route_frequencies.iterrows():
-            start_time = row["start_time"]
-            end_time = row["end_time"]
-            if start_time == "00:00:00":
-                has_start_time = True
-            if end_time == "24:00:00":
-                has_end_time = True
-
-        return has_start_time and has_end_time
-
-    def check_night_routes(self, valid_services, is_nighttime):
-        """
-        Filters the given list of route IDs to only include night routes if is_nighttime is True.
-
-        Parameters:
-        valid_services (list): A list of route IDs to filter.
-        is_nighttime (bool): True if it is nighttime, False otherwise.
-
-        Returns:
-        list: A list of route IDs that are night routes if is_nighttime is True, or all route IDs otherwise.
-        """
-        if is_nighttime:
-            # nighttime_routes = [route_id for route_id in valid_services if route_id.endswith("N")]
-            nighttime_routes = [
-                route_id
-                for route_id in valid_services
-                if route_id.endswith("N") or self.is_24_hour_service(route_id)
-            ]
-            if nighttime_routes:
-                return nighttime_routes
-            else:
-                return None
-        else:
-            daytime_routes = [route_id for route_id in valid_services if not route_id.endswith("N")]
-            if daytime_routes:
-                return daytime_routes
-            else:
-                return None
-
-    def is_nighttime(self, source_hour):
-        """
-        Determines if the given hour is during the nighttime.
-
-        Parameters:
-        source_hour (datetime.time): The hour to check.
-
-        Returns:
-        bool: True if the hour is during the nighttime, False otherwise.
-        """
-        start_time = time(0, 0, 0)
-        end_time = time(5, 30, 0)
-        if start_time <= source_hour <= end_time:
-            return True
-        else:
-            return False
-
-    def is_holiday(self, date_string):
-        """
-        Checks if a given date is a holiday.
-
-        Parameters:
-        date_string (str): A string representing the date in the format "dd/mm/yyyy".
-
-        Returns:
-        bool: True if the date is a holiday, False otherwise.
-        """
-        # Local holidays
-        if date_string in self.special_dates:
-            return True
-        date_obj = datetime.strptime(date_string, "%d/%m/%Y")
-
-        # Weekend days
-        day_of_week = date_obj.weekday()
-        if day_of_week == 5 or day_of_week == 6:
-            return True
-        return False
-
-    def is_rush_hour(self, source_hour):
-        """
-        Determines if the given hour is during rush hour.
-
-        Parameters:
-        source_hour (datetime.time): The hour to check.
-
-        Returns:
-        bool: True if the hour is during rush hour, False otherwise.
-        """
-        am_start_time = time(5, 30, 0)
-        am_end_time = time(9, 0, 0)
-        pm_start_time = time(17, 30, 0)
-        pm_end_time = time(21, 0, 0)
-        if (
-            am_start_time <= source_hour <= am_end_time
-            or pm_start_time <= source_hour <= pm_end_time
-        ):
-            return True
-        else:
-            return False
-
-    def check_express_routes(self, valid_services, is_rush_hour):
-        """
-        Filters the given list of route IDs to only include express routes if is_rush_hour is True.
-
-        Parameters:
-        valid_services (list): A list of route IDs to filter.
-        is_rush_hour (bool): True if it is rush hour, False otherwise.
-
-        Returns:
-        list: A list of route IDs that are express routes if is_rush_hour is True, or all route IDs otherwise.
-        """
-        if is_rush_hour:
-            return valid_services
-        else:
-            regular_hour_routes = [
-                route_id for route_id in valid_services if not route_id.endswith("e")
-            ]
-            return regular_hour_routes
-
-    def get_trip_day_suffix(self, date):
-        """
-        Based on the given date, gets the corresponding trip day suffix for the trip IDs.
-
-        Parameters:
-        date (date): The date to be checked.
-
-        Returns
-        str: A string with the trip day suffix.
-        """
-        date_object = datetime.strptime(date, "%d/%m/%Y")
-        day_of_week = date_object.weekday()
-
-        if day_of_week < 5:
-            trip_day_suffix = "L"
-        elif day_of_week == 5:
-            trip_day_suffix = "S"
-        else:
-            trip_day_suffix = "D"
-
-        return trip_day_suffix
-
-    def get_arrival_times(self, route_id, stop_id, source_date):
-        """
-        Returns the arrival times for a given route and stop.
-
-        Parameters:
-        route_id (str): A string representing the ID of the route.
-        stop_id (str): A string representing the ID of the stop.
-        source_date (str): A string representing the date of the travel.
-
-        Returns:
-        tuple: A tuple containing a string representing the bus orientation ("round" or "return") and a list of datetime objects representing the arrival times.
-        """
-        # Read the frequencies.txt file
-        frequencies = pd.read_csv("frequencies.txt")
-
-        # Filter the frequencies for the given route ID
-        route_frequencies = frequencies[frequencies["trip_id"].str.startswith(route_id)]
-
-        # Get the day suffix
-        day_suffix = self.get_trip_day_suffix(source_date)
-
-        # Get the arrival times for the stop for each trip
-        stop_route_times = []
-        bus_orientation = ""
-        for _, row in route_frequencies.iterrows():
-            start_time = pd.Timestamp(row["start_time"])
-            if row["end_time"] == "24:00:00":
-                end_time = pd.Timestamp("23:59:59")
-            else:
-                end_time = pd.Timestamp(row["end_time"])
-            headway_secs = row["headway_secs"]
-            round_trip_id = f"{route_id}-I-{day_suffix}"
-            return_trip_id = f"{route_id}-R-{day_suffix}"
-            round_stop_times = pd.read_csv("stop_times.txt").query(
-                f"trip_id.str.startswith('{round_trip_id}') and stop_id == '{stop_id}'"
-            )
-            return_stop_times = pd.read_csv("stop_times.txt").query(
-                f"trip_id.str.startswith('{return_trip_id}') and stop_id == '{stop_id}'"
-            )
-            if len(round_stop_times) == 0 and len(return_stop_times) == 0:
-                return
-            elif len(round_stop_times) > 0:
-                bus_orientation = "round"
-                stop_time = pd.Timestamp(round_stop_times.iloc[0]["arrival_time"])
-            elif len(return_stop_times) > 0:
-                bus_orientation = "return"
-                stop_time = pd.Timestamp(return_stop_times.iloc[0]["arrival_time"])
-            for freq_time in pd.date_range(start_time, end_time, freq=f"{headway_secs}s"):
-                freq_time_str = freq_time.strftime("%H:%M:%S")
-                freq_time = datetime.strptime(freq_time_str, "%H:%M:%S")
-                stop_route_time = datetime.combine(datetime.min, stop_time.time()) + timedelta(
-                    seconds=(freq_time - datetime.min).seconds
-                )
-                if stop_route_time not in stop_route_times:
-                    stop_route_times.append(stop_route_time)
-                stop_time += pd.Timedelta(seconds=headway_secs)
-
-        return bus_orientation, stop_route_times
-
-    def get_time_until_next_bus(self, arrival_times, source_hour, source_date):
-        """
-        Returns the time until the next three buses.
-
-        Parameters:
-        arrival_times (list): A list of datetime objects representing the arrival times of the buses.
-        source_hour (datetime.time): The source hour to compare with the arrival times.
-        source_date (datetime.date): The source date to check if there are buses remaining.
-
-        Returns:
-        list: A list of tuples representing the time until the next three buses in minutes and seconds.
-        """
-        arrival_times_remaining = []
-        for a_time in arrival_times:
-            if a_time.time() >= source_hour:
-                arrival_times_remaining.append(a_time)
-        # arrival_times_remaining = [time for time in arrival_times if time.time() >= source_hour]
-        if len(arrival_times_remaining) == 0:
+        stops_dict = self.route_stops.get(route_id)
+        if not stops_dict:
             return None
-        else:
-            # Sort the remaining arrival times in ascending order
-            arrival_times_remaining.sort()
+        stop_info = stops_dict.get(stop_id)
+        if not stop_info:
+            return None
+        trips_here = stop_info.get("trips_here") or []
+        if not trips_here:
+            return None
 
-            # Get the datetime objects for the next three buses
-            next_buses = []
-            for i in range(min(3, len(arrival_times_remaining))):
-                next_arrival_time = arrival_times_remaining[i]
-                next_bus = datetime.combine(next_arrival_time.date(), next_arrival_time.time())
-                next_buses.append(next_bus)
+        filter_svc = bool(active_services)
+        best: int | None = None
+        for trip_id, offset_secs in trips_here:
+            if filter_svc:
+                sid = self.trip_service.get(trip_id)
+                if sid is None or sid not in active_services:
+                    continue
+            dispatches = self.trip_dispatches.get(trip_id)
+            if not dispatches:
+                continue
+            for d in dispatches:
+                abs_secs = d + offset_secs
+                if abs_secs >= after_secs and (best is None or abs_secs < best):
+                    best = abs_secs
+        return best
 
-            if next_buses is None:
-                print("No buses remaining for the specified date.")
-            else:
-                # Calculate the time until the next three buses
-                time_until_next_buses = []
-                for next_bus in next_buses:
-                    time_until_next_bus = (
-                        next_bus - datetime.combine(next_bus.date(), source_hour)
-                    ).total_seconds()
-                    minutes, seconds = divmod(time_until_next_bus, 60)
-                    time_until_next_buses.append((int(minutes), int(seconds)))
+    def common_lines_for_segment(
+        self,
+        route_id: str,
+        leg_stops: list,
+        departure_dt=None,
+        *,
+        within_minutes: float = 15.0,
+        min_overlap: float = 0.5,
+        respect_calendar: bool = True,
+        max_options: int = 6,
+    ) -> list[dict]:
+        """Líneas que cubren el MISMO tramo que el segmento dado (mismos
+        paraderos de subida/bajada y corredor compatible), como "opciones de
+        recorrido" intercambiables.
 
-                return time_until_next_buses
+        Implementa el patrón de **líneas comunes** (common lines / estrategias
+        óptimas de Spiess & Florian): cuando varias líneas sirven un mismo
+        tramo, desde el punto de vista del usuario son intercambiables ("toma la
+        que llegue primero"), por lo que conviene presentarlas como un único
+        viaje con varias opciones de recorrido en vez de itinerarios separados.
 
-    def timedelta_to_hhmm(self, td):
-        """
-        Converts a timedelta object to a string in HHMM format.
+        **Criterio de corredor.** La subida y la bajada deben coincidir y la
+        línea candidata debe recorrer el mismo corredor entre ambas, pero PUEDE
+        saltarse paraderos intermedios (rutas expresas / variantes, comunes en
+        Santiago). Se acepta si los paraderos que la candidata hace entre subida
+        y bajada están contenidos en (o contienen a) los del tramo elegido con un
+        solape ``>= min_overlap`` — nunca si introduce paraderos ajenos que
+        delaten otra calle. Si alguno de los dos no tiene paraderos intermedios
+        (tramo de 2 paradas, o expreso que se salta todo), basta con que la
+        candidata recorra subida→bajada en ese orden.
 
-        Parameters:
-        td (timedelta): The timedelta object to be converted.
+        **Filtro de servicio/hora.** Si se pasa ``departure_dt``, sólo se listan
+        líneas que operan ese día (``calendar.txt`` vía ``active_services_on``) y
+        con una salida desde el paradero de subida dentro de
+        ``[salida - 1 min, salida + within_minutes]``. Con ``departure_dt=None``
+        no se filtra por hora (sólo estructura).
+
+        Args:
+            route_id: ruta del tramo elegido (se excluye del resultado).
+            leg_stops: paraderos del tramo en orden ``[subida, ..., bajada]``.
+            departure_dt: ``datetime`` de salida del tramo (para el filtro de
+                hora). ``None`` → sin filtro temporal.
+            within_minutes: ventana hacia adelante para considerar "un paso
+                próximo".
+            min_overlap: solape mínimo (contención) de paraderos intermedios.
+            respect_calendar: filtrar por servicios activos en la fecha de salida.
+            max_options: máximo de alternativas devueltas.
 
         Returns:
-        str: A formated string with the time.
+            Lista de dicts ``{route_id, route_short_name, route_long_name,
+            route_color, mode, next_departure_secs}`` ordenada por próxima salida;
+            ``[]`` si no hay líneas equivalentes. NO incluye ``route_id`` (la
+            línea elegida); el llamador ya la conoce.
         """
-        total_seconds = int(td.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        return f"{hours:02d}:{minutes:02d}"
+        if not leg_stops or len(leg_stops) < 2:
+            return []
+        board, alight = leg_stops[0], leg_stops[-1]
+        if board is None or alight is None or board == alight:
+            return []
+        inter_leg = {s for s in leg_stops[1:-1] if s is not None}
 
-    def timedelta_separator(self, td):
-        """
-        Separates a timedelta object into minutes and seconds.
+        candidates = [r for r in self.connection_finder(board, alight) if r != route_id]
+        if not candidates:
+            return []
 
-        Parameters:
-        td (timedelta): A timedelta object representing a duration of time.
+        active: frozenset = frozenset()
+        dep_secs: int | None = None
+        window_hi: int | None = None
+        if departure_dt is not None:
+            t = departure_dt.time()
+            dep_secs = t.hour * 3600 + t.minute * 60 + t.second
+            window_hi = dep_secs + int(within_minutes * 60)
+            if respect_calendar and hasattr(self, "active_services_on"):
+                active = self.active_services_on(departure_dt.date())
 
-        Returns:
-        tuple: A tuple containing the number of minutes and seconds in the timedelta object. The minutes and seconds are both integers.
-        """
-        total_seconds = td.total_seconds()
-        minutes = int(total_seconds // 60)
-        seconds = int(total_seconds % 60)
-        return minutes, seconds
+        order_by_dir = self._route_dir_stop_order
+        stops_by_dir = self._route_dir_stops_ordered
 
-    def get_travel_time(self, trip_id, stop_ids):
-        """
-        Returns the travel time between two stops for a given trip.
+        options: list[dict] = []
+        seen: set[str] = set()
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
 
-        Parameters:
-        trip_id (str): A string representing the ID of the trip.
-        stop_ids (list): A list of two strings representing the IDs of the stops.
+            # Dirección donde subida precede a bajada (menor span, como
+            # get_route_stops_segment). Descarta el sentido contrario.
+            best_dir = None
+            best_span = None
+            for direction in (0, 1):
+                order = order_by_dir.get((cand, direction))
+                if not order:
+                    continue
+                i_b = order.get(board)
+                i_a = order.get(alight)
+                if i_b is None or i_a is None or i_b >= i_a:
+                    continue
+                span = i_a - i_b
+                if best_span is None or span < best_span:
+                    best_span = span
+                    best_dir = direction
+            if best_dir is None:
+                continue
 
-        Returns:
-        timedelta: A timedelta object representing the travel time.
-        """
-        stop_times = pd.read_csv("stop_times.txt").query(
-            f"trip_id.str.startswith('{trip_id}') and stop_id in {stop_ids}"
+            order = order_by_dir[(cand, best_dir)]
+            stops_ordered = stops_by_dir.get((cand, best_dir)) or []
+            i_b = order[board]
+            i_a = order[alight]
+            inter_cand = {s for s in stops_ordered[i_b + 1 : i_a] if s is not None}
+
+            # Test de corredor por contención: con intermedios en ambos, exigir
+            # solape sobre el menor; si alguno es vacío, basta el orden subida<bajada.
+            if inter_leg and inter_cand:
+                overlap = len(inter_leg & inter_cand) / min(len(inter_leg), len(inter_cand))
+                if overlap < min_overlap:
+                    continue
+
+            # Filtro de servicio/hora (solo si hay departure_dt).
+            next_dep: int | None = None
+            if dep_secs is not None:
+                next_dep = self._next_departure_secs(cand, board, dep_secs - 60, active)
+                if next_dep is None:
+                    # Sin paso válido en/después de la salida: si la ruta SÍ tiene
+                    # horario aquí, su próximo bus ya pasó o cae fuera → no es
+                    # alternativa. Si no hay datos de horario, ser indulgente
+                    # (incluir) para no perder líneas por gaps del feed.
+                    ti = self.route_stops.get(cand, {}).get(board, {})
+                    if ti.get("trips_here"):
+                        continue
+                elif next_dep > window_hi:
+                    continue
+
+            meta = self.route_meta.get(cand) or {}
+            options.append(
+                {
+                    "route_id": cand,
+                    "route_short_name": meta.get("short_name"),
+                    "route_long_name": meta.get("long_name"),
+                    "route_color": meta.get("route_color"),
+                    "mode": meta.get("mode", "bus"),
+                    "next_departure_secs": next_dep,
+                }
+            )
+
+        options.sort(
+            key=lambda o: (
+                o["next_departure_secs"] is None,
+                o["next_departure_secs"] if o["next_departure_secs"] is not None else 0,
+                o["route_short_name"] or o["route_id"],
+            )
         )
-        if len(stop_times) < 2:
-            return None
-        arrival_times = [
-            datetime.strptime(arrival_time, "%H:%M:%S")
-            for arrival_time in stop_times["arrival_time"]
-        ]
-        travel_time = arrival_times[1] - arrival_times[0]
-        return travel_time
-
-    def get_trip_sequence(self, route_id, stop_id):
-        """
-        Given a dictionary of routes and stops, a route ID and a stop ID, gets the trip sequence number corresponding to the stop.
-
-        Parameters:
-        route_id (str): The route or service's ID.
-        stop_id (str): The stop's ID.
-
-        Returns:
-        str: A string representing the sequence number.
-        """
-        seq = self.route_stops[route_id][stop_id]["sequence"]
-        return seq
+        return options[:max_options]
 
     @staticmethod
     def haversine(lon1, lat1, lon2, lat2):
@@ -1685,28 +1217,6 @@ class GTFSData:
 
         a = sin(half_delta_lat) ** 2 + cos(lat1_rad) * cos(lat2_rad) * sin(half_delta_lon) ** 2
         return _EARTH_RADIUS_KM * 2.0 * asin(sqrt(a))
-
-    def walking_travel_time(self, stop_coords, location_coords, speed):
-        """
-        Calculates the walking travel time between a location and a stop, given a speed value.
-
-        Parameters:
-        stop_coords (tuple): A tuple with the stop's coordinates (lat, lon).
-        location_coords (tuple):  A tuple with the location's coordinates (lat, lon).
-        speed (float): The walking speed value in km/h.
-
-        Returns.
-        float: The time (in seconds) that represents the travel time.
-        """
-        # Extract lat/lon from tuples (order: lat, lon)
-        stop_lat, stop_lon = stop_coords
-        location_lat, location_lon = location_coords
-
-        # Call haversine with correct parameter order: lon1, lat1, lon2, lat2
-        distance = self.haversine(stop_lon, stop_lat, location_lon, location_lat)
-
-        time = round((distance / speed) * 3600, 2)
-        return time
 
     def get_nearby_stops(self, location_coords, margin_km=0.5, max_stops=10):
         """
@@ -1761,27 +1271,11 @@ class GTFSData:
         Returns:
             tuple: (lon, lat) o None si no existe la parada
         """
-        coords = self._stop_coords.get(stop_id)
-        if coords is not None:
-            return coords
-
-        # Fallback: parada presente en el scheduler pero no en ninguna ruta
-        try:
-            stop = self.scheduler.stops_by_id(stop_id)
-            if stop and len(stop) > 0:
-                stop_obj = stop[0]
-                if stop_obj.stop_lon is not None and stop_obj.stop_lat is not None:
-                    resolved = (stop_obj.stop_lon, stop_obj.stop_lat)
-                    self._stop_coords[stop_id] = resolved
-                    return resolved
-        except (KeyError, AttributeError, ValueError) as e:
-            logging.getLogger(__name__).warning(
-                "get_stop_coords fallback failed for %s: %s",
-                stop_id,
-                e,
-            )
-
-        return None
+        # _stop_coords se precomputa al arranque (en _build_route_index) cubriendo
+        # tanto las paradas de rutas como las sueltas del feed, así que basta el
+        # lookup en memoria — no se consulta el scheduler SQLite en tiempo de
+        # request (ver nota de hilos en _build_route_index).
+        return self._stop_coords.get(stop_id)
 
     def find_nearby_routes(self, stop_id: str, margin_km: float = 0.5):
         """
@@ -1921,6 +1415,15 @@ class GTFSData:
         versión los stop_ids viejos no existen y los transbordos cargados
         son basura — mejor recomputar que servir transbordos huérfanos.
         Lanza ``ValueError`` si el cache está obsoleto.
+
+        El chequeo global no basta: un cambio de ids que afecte sólo a un modo
+        minoritario (p.ej. el Metro: ~150 de ~12k paradas) no mueve el umbral
+        global del 10% porque los ~11k paraderos de bus —estables entre
+        versiones— lo dominan. El resultado es que TODOS los footpaths
+        bus↔metro quedan huérfanos (su ``to_stop`` ya no existe) y el Metro
+        desaparece silenciosamente de los viajes. Por eso, además del umbral
+        global, validamos cobertura **por modo** sobre las paradas de origen y
+        destino del cache.
         """
         feed_stops = self.stops if isinstance(self.stops, set) else set(self.stops)
         if not feed_stops:
@@ -1934,6 +1437,27 @@ class GTFSData:
                 f"{len(unknown)}/{len(cache_stops)} stop_ids del cache no están "
                 f"en el feed actual (probable cambio de versión)"
             )
+
+        # Cobertura por modo: agrupamos las paradas del cache por el modo de la
+        # ruta que las usa (origen vía from_route, destino vía to_route) y
+        # exigimos que cada modo siga existiendo en el feed. Si casi todas las
+        # paradas de un modo desaparecieron, sus transbordos son huérfanos →
+        # recomputar aunque el global pase.
+        mode_stops: dict[str, set] = defaultdict(set)
+        for (from_route, from_stop), conns in tm.transfers.items():
+            mode_stops[self.get_route_mode(from_route)].add(from_stop)
+            for t in conns:
+                mode_stops[self.get_route_mode(t.to_route_id)].add(t.to_stop_id)
+        for mode, stops in mode_stops.items():
+            if len(stops) < 20:
+                continue  # muestra demasiado chica para un veredicto robusto
+            unknown_m = stops - feed_stops
+            if len(unknown_m) / len(stops) > 0.50:
+                raise ValueError(
+                    f"modo '{mode}': {len(unknown_m)}/{len(stops)} paradas del "
+                    f"cache no están en el feed actual (cambio de ids del feed "
+                    f"para ese modo; sus transbordos quedarían huérfanos)"
+                )
 
     def get_or_compute_transfers(
         self,
@@ -1991,57 +1515,3 @@ class GTFSData:
 
         return tm
 
-    def get_transfer_options(self, route_id: str, stop_id: str, viable_only: bool = True):
-        """
-        Obtiene opciones de transbordo desde una parada de una ruta.
-
-        Args:
-            route_id: ID de la ruta actual
-            stop_id: ID de la parada actual
-            viable_only: Si True, solo retorna transferencias viables
-
-        Returns:
-            list: Lista de TransferConnection disponibles
-        """
-        if not hasattr(self, "transfer_manager"):
-            return []
-
-        if viable_only:
-            return self.transfer_manager.get_viable_transfers_from(route_id, stop_id)
-        else:
-            return self.transfer_manager.get_transfers_from(route_id, stop_id)
-
-    def parse_metro_stations(self, stops_file):
-        """
-        Parses the Metro Stations data, creating a dictionary with their names.
-
-        Parameters:
-        stops_file (File): The GTFS file with the stop data (stops.txt).
-
-        Returns:
-        dict: A dictionary with the names of the stations.
-        """
-        subway_stops = {}
-        with open(stops_file) as f:
-            for line in f:
-                stop_id, _, stop_name, _, _, _, _ = line.strip().split(",")
-                if stop_id.isdigit():
-                    subway_stops[stop_id] = stop_name
-        return subway_stops
-
-    def is_metro_station(self, stop_id, route_dict):
-        """
-        Checks if a stop is a Metro station.
-
-        Parameters:
-        stop_id (str): The stop's ID to be checked.
-        route_dict (dict): The dictionary with the Metro stations names.
-
-        Returns:
-        str or None: A string with the stop ID if the stop is a Metro station, or None if it isn't.
-        """
-        try:
-            route_num = int(stop_id)
-            return route_dict[stop_id]
-        except ValueError:
-            return None

@@ -124,37 +124,3 @@ def _clean_stops_file(stops_file_path):
             cleaned_rows.append(row)
 
     return cleaned_rows
-
-
-def is_gtfs_valid(gtfs_zip_path):
-    """
-    Quick validation of GTFS file without full loading.
-
-    Parameters:
-        gtfs_zip_path (str or Path): Path to GTFS.zip
-
-    Returns:
-        bool: True if GTFS appears valid, False otherwise
-    """
-    gtfs_path = Path(gtfs_zip_path)
-
-    if not gtfs_path.exists():
-        return False
-
-    try:
-        with zipfile.ZipFile(gtfs_path, "r") as zf:
-            # Check for required files
-            required_files = [
-                "stops.txt",
-                "routes.txt",
-                "trips.txt",
-                "stop_times.txt",
-            ]
-            for req_file in required_files:
-                if req_file not in zf.namelist():
-                    logger.warning(f"Missing required file: {req_file}")
-                    return False
-        return True
-    except zipfile.BadZipFile:
-        logger.error(f"Invalid ZIP file: {gtfs_zip_path}")
-        return False
