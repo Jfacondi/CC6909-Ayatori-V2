@@ -11,7 +11,7 @@ import { renderSliders, renderProfiles, renderModes, resetSingleConfig } from ".
 import { renderVariants, addVariant } from "./compare.js";
 import { renderGroups } from "./results.js";
 import { initTheme } from "./ui/theme.js";
-import { initSheet } from "./ui/sheet.js";
+import { initSheet, isMobileSheet, setSheetState } from "./ui/sheet.js";
 import { toast } from "./ui/toast.js";
 import { writePermalink, applyPermalink } from "./permalink.js";
 
@@ -219,6 +219,13 @@ function wireEvents() {
   $("btn-now").addEventListener("click", () => setDeparture(true));
   $("btn-share").addEventListener("click", shareTrip);
   $("btn-print").addEventListener("click", () => window.print());
+  $("btn-mobile-settings").addEventListener("click", (e) => {
+    const open = $("panel").classList.toggle("cfg-open");
+    e.currentTarget.setAttribute("aria-expanded", String(open));
+    // Sin esto el sheet queda en `half` y la config revelada cae bajo el borde
+    // visible: parece que el botón no hace nada. Al abrir, sube a `full`.
+    if (isMobileSheet()) setSheetState(open ? "full" : "half");
+  });
 }
 
 async function boot() {

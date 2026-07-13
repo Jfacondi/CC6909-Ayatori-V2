@@ -281,6 +281,15 @@ export function fitToJourneys() {
   if (fg.getLayers().length) map.fitBounds(fg.getBounds(), { padding: [40, 40] });
 }
 
+/** Encuadra un journey concreto. `opts` acepta el padding de Leaflet (p. ej.
+ *  dejar hueco abajo para el bottom sheet en móvil). */
+export function fitJourney(idx, opts) {
+  const g = journeyLayers[idx];
+  if (!g) return;
+  const fg = L.featureGroup(g.getLayers ? g.getLayers() : []);
+  if (fg.getLayers().length) map.fitBounds(fg.getBounds(), opts);
+}
+
 // ── Highlight selectivo del journey activo ──────────────────────────────
 
 function applyEmphasis(layerGroup, mode) {
@@ -316,8 +325,10 @@ export function renderLegend(opts) {
   const walkRow = `<div class="lg-row"><span class="sw" style="background:${WALK_COLOR};height:0;border-top:3px dashed ${WALK_COLOR}"></span>${svgIcon("i-walk")} Caminata</div>`;
   const transferRow = `<div class="lg-row"><span class="sw" style="background:${TRANSFER_COLOR};height:0;border-top:3px dashed ${TRANSFER_COLOR}"></span>${svgIcon("i-transfer")} Transbordo</div>`;
 
+  let title, rows;
   if (opts && Array.isArray(opts.routes) && opts.routes.length) {
-    const rows = opts.routes
+    title = `Rutas usadas <span class="legend__count">${opts.routes.length}</span>`;
+    rows = opts.routes
       .map((r) => {
         const long = r.long
           ? ` <span style="color:var(--text-muted);font-size:10px">${r.long}</span>`
@@ -325,16 +336,22 @@ export function renderLegend(opts) {
         return `<div class="lg-row"><span class="sw" style="background:${r.color}"></span>${modeSvg(r.mode)} <strong>${r.label}</strong>${long}</div>`;
       })
       .join("");
-    el.innerHTML = `<h3>Rutas usadas</h3>${rows}${walkRow}${transferRow}`;
   } else {
-    const rows = state.availableModes
+    title = "Leyenda";
+    rows = state.availableModes
       .map((m) => {
         const st = modeStyle(m);
         return `<div class="lg-row"><span class="sw" style="background:${st.color}"></span>${modeSvg(m)} ${st.label}</div>`;
       })
       .join("");
-    el.innerHTML = `<h3>Leyenda</h3>${rows}${walkRow}${transferRow}`;
   }
+  // Colapsable: en móvil arranca cerrada (ocupaba mucho mapa); en escritorio abierta.
+  const open = matchMedia("(max-width: 767px)").matches ? "" : "open";
+  el.innerHTML =
+    `<details class="legend__d" ${open}>` +
+    `<summary>${title}${svgIcon("i-chevron", "icon chevron")}</summary>` +
+    `<div class="legend__body">${rows}${walkRow}${transferRow}</div>` +
+    `</details>`;
   el.classList.add("show");
 }
 

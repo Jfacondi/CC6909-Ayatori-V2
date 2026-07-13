@@ -305,6 +305,27 @@
   max-width: calc(100% - 32px);
 }
 
+/* Botón «volver a resultados»: aparece en móvil al elegir una ruta (el panel
+   baja para ver el mapa) y sube el sheet de vuelta a donde estaba. */
+.map-back {
+  position: absolute;
+  top: var(--space-3); left: 50%; transform: translateX(-50%);
+  z-index: var(--z-legend);
+  display: none;
+  align-items: center; gap: var(--space-1);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: 9px 16px;
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  cursor: pointer;
+}
+.map-back.show { display: inline-flex; }
+.map-back .icon { transform: rotate(180deg); } /* chevron hacia arriba: «subir panel» */
+
 /* ── Leyenda sobre el mapa ──────────────────────────────────────────────── */
 .legend {
   position: absolute; bottom: var(--space-4); right: var(--space-3);
@@ -320,9 +341,22 @@
   display: none;
 }
 .legend.show { display: block; }
-.legend h3 {
-  margin: 0 0 6px; font-size: var(--text-2xs); text-transform: uppercase;
-  letter-spacing: 0.06em; color: var(--text-muted);
+.legend summary {
+  list-style: none; cursor: pointer;
+  display: flex; align-items: center; gap: 6px;
+  font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); font-weight: var(--weight-semibold);
+}
+.legend summary::-webkit-details-marker { display: none; }
+.legend summary .chevron {
+  margin-left: auto; width: 12px; height: 12px;
+  transition: transform var(--dur-base) var(--ease);
+}
+.legend__d[open] summary { margin-bottom: 6px; }
+.legend__d[open] summary .chevron { transform: rotate(180deg); }
+.legend__count {
+  color: var(--text); background: var(--surface-3);
+  border-radius: var(--radius-full); padding: 0 6px; letter-spacing: 0;
 }
 .legend .lg-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
 .legend .sw { width: 16px; height: 4px; border-radius: 2px; display: inline-block; flex: none; }
@@ -345,8 +379,22 @@
    Responsive: < 768px → mapa a pantalla completa + bottom sheet arrastrable
    ───────────────────────────────────────────────────────────────────────── */
 .sheet-grip { display: none; }
+/* El toggle "Ajustes" solo existe en móvil (regla sin capa: gana a .btn). */
+.settings-toggle { display: none; }
 
 @media (max-width: 767px) {
+  /* Cabecera mínima: fuera las stats del feed y la ayuda de escritorio
+     («click derecho» no aplica en táctil) — ruido que empuja el botón. */
+  .health { display: none; }
+  #status { display: none; }
+
+  /* Búsqueda primero: origen/destino + Planificar visibles; el resto de la
+     configuración (perfil, modos, alternativas, CSA) se pliega bajo "Ajustes". */
+  .settings-toggle { display: flex; justify-content: flex-start; }
+  .settings-toggle .chevron { margin-left: auto; transition: transform var(--dur-base) var(--ease); }
+  .panel.cfg-open .settings-toggle .chevron { transform: rotate(180deg); }
+  .panel:not(.cfg-open) .mcfg { display: none; }
+
   .app { grid-template-columns: 1fr; grid-template-rows: 1fr; position: relative; }
 
   .map-wrap { grid-row: 1; grid-column: 1; }
@@ -380,7 +428,18 @@
 
   .brand { padding: var(--space-2) var(--space-4); border-bottom: 0; }
   .brand__sub { display: none; }
-  .panel__scroll { padding: 0 var(--space-4) var(--space-4); }
+  /* Más densidad vertical: acerca «Planificar» al borde visible del sheet. */
+  .panel__scroll { padding: 0 var(--space-4) var(--space-4); gap: var(--space-3); }
+
+  /* Inputs a 16px: por debajo de eso iOS Safari hace zoom al enfocar. */
+  .input { font-size: var(--text-lg); }
+
+  /* Objetivos táctiles cómodos para el dedo (~44px) en vez de los compactos
+     de escritorio (36/34/26px). */
+  .btn { padding: 12px 16px; }
+  .btn--sm { padding: 10px 12px; }
+  .btn--icon { width: 44px; height: 44px; }
+  .chip { padding: 9px 14px; }
 
   .legend { bottom: calc(var(--sheet-height, 52vh) + 12px); }
   .map-fab { top: var(--space-3); }

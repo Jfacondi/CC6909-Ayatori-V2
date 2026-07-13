@@ -133,19 +133,28 @@ class OSMGraph:
         if ck in self._sp_cache:
             return self._sp_cache[ck]
 
+        # A* goal-directed con heurística admisible = Haversine en metros al destino
+        # (la caminata real por calles nunca es menor que la línea recta, y los pesos
+        # de arista ya están en metros → heurística admisible → camino mínimo EXACTO,
+        # idéntico a Dijkstra). A diferencia de Dijkstra —que asienta toda la bola de
+        # radio = distancia al destino— A* dirige la búsqueda hacia el objetivo: en
+        # egresos lejanos pasa de decenas/cientos de ms a <1 ms; en caminatas cortas
+        # es igual. (Dijkstra con target ya cortaba temprano; A* poda además el frente.)
+        tnode = self.graph[tgt]
+        tlat, tlon = tnode["lat"], tnode["lon"]
         try:
-            paths = rx.dijkstra_shortest_paths(
-                self.graph,
-                src,
-                target=tgt,
-                weight_fn=float,
+            node_path = list(
+                rx.astar_shortest_path(
+                    self.graph,
+                    src,
+                    goal_fn=lambda p: p["node_id"] == tid,
+                    edge_cost_fn=float,
+                    estimate_cost_fn=lambda p: _haversine_m(p["lat"], p["lon"], tlat, tlon),
+                )
             )
-        except Exception:
+        except Exception:  # NoPathFound u otro → el llamador cae a Haversine
             self._sp_cache[ck] = None
             return None
-
-        # rustworkx PathMapping no tiene .get(); indexar con guarda de pertenencia.
-        node_path = list(paths[tgt]) if tgt in paths else None
         if not node_path:
             self._sp_cache[ck] = None
             return None

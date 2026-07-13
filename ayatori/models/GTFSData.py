@@ -85,6 +85,8 @@ class GTFSData:
         _tick("build_shape_index")
         self._build_route_meta()
         _tick("build_route_meta")
+        self._build_stop_modes()
+        _tick("build_stop_modes")
         self._build_calendar_index()
         _tick("build_calendar_index")
 
@@ -343,6 +345,27 @@ class GTFSData:
                 "route_color": r.route_color,
                 "mode": self._mode_from_route_type(rt if rt is not None else 3),
             }
+
+    def _build_stop_modes(self):
+        """Parada → modos canónicos que la sirven, INCLUYENDO terminales.
+
+        A diferencia de ``_stop_to_routes`` (derivado de ``route_stops``, que
+        excluye la última parada de cada trip), aquí se recorre la secuencia
+        COMPLETA de cada trip (``self.trips``). Esto permite que un filtro de modo
+        reconozca la plataforma terminal de una línea de metro —siempre última
+        parada, sin ruta *abordable*— como parada de egreso válida. Sólo se usa
+        para seleccionar paradas de acceso/egreso en ``_candidate_stops``; el hot
+        path de Dijkstra sigue usando ``_stop_to_routes`` (abordabilidad).
+        O(#stop_times), una vez al arranque. Requiere ``route_meta`` ya poblado.
+        """
+        self.stop_modes: dict[str, set[str]] = defaultdict(set)
+        for trip_id, trip_seq in self.trips.items():
+            route_id = self.trip_route.get(trip_id)
+            if route_id is None:
+                continue
+            mode = self.get_route_mode(route_id)
+            for stop_id, _offset in trip_seq:
+                self.stop_modes[stop_id].add(mode)
 
     def get_route_meta(self, route_id: str) -> dict | None:
         """Metadata de una ruta (route_type, agencia, nombres, modo) o None."""

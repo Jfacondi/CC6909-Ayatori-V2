@@ -38,6 +38,10 @@ CASES = [
     ("Cobertura aeropuerto (Costanera→SCL)", [-33.4178, -70.6063], [-33.3930, -70.7858], "fastest", "route", None),
     ("prefer_rail (Maipú→Tobalaba)", [-33.5110, -70.7580], [-33.4180, -70.6020], "prefer_rail", "route", None),
     ("Solo-metro filtrado (Baquedano→Tobalaba)", [-33.4370, -70.6340], [-33.4180, -70.6020], "fastest", "route", ["metro"]),
+    # Metro-only hacia un TERMINAL (última parada de la línea). Regresión: antes
+    # devolvía 0 viajes (la plataforma terminal quedaba fuera del filtro de modo);
+    # el 7º campo exige que el egreso sea corto (baja en el terminal, no a ~900 m).
+    ("Metro-only a terminal (Maipú→Puente Alto)", [-33.50993, -70.75732], [-33.60952, -70.57584], "fastest", "route", ["metro"], 0.4),
     ("Borde: origen==destino", [-33.4376, -70.6504], [-33.4376, -70.6504], "balanced", "walk", None),
     ("Borde: ~300 m a pie", [-33.4376, -70.6504], [-33.4400, -70.6520], "fastest", "walk", None),
     ("Borde: océano (inalcanzable)", [-33.0000, -71.9000], [-33.4000, -70.6000], "fastest", "empty", None),
@@ -63,7 +67,7 @@ def dominates(x, y):
     return all(a <= b for a, b in zip(xa, ya)) and any(a < b for a, b in zip(xa, ya))
 
 
-def check(name, o, d, profile, expect, allowed):
+def check(name, o, d, profile, expect, allowed, max_egress_km=None):
     body = {"origin": o, "destination": d, "departure": DEP,
             "num_alternatives": 4, "profile": profile}
     if allowed:
@@ -123,6 +127,16 @@ def check(name, o, d, profile, expect, allowed):
             issues.append(f"caminata directa esperada pero {best['number_of_transfers']} transbordos")
         if any(s["type"] == "transit" for s in best["segments"]):
             issues.append("caminata directa esperada pero hay tramos de transporte")
+
+    # Egreso corto: para filtros de modo hacia un terminal, verifica que el viaje
+    # baje EN el terminal (última caminata pequeña) y no en una parada previa a
+    # cientos de metros. Es la regresión del terminal inalcanzable bajo filtro.
+    if max_egress_km is not None:
+        walks = [s for s in best["segments"] if s["type"] == "walk"]
+        egress = walks[-1]["distance_km"] if walks else 0.0
+        if egress > max_egress_km:
+            issues.append(f"egreso {egress*1000:.0f} m > {max_egress_km*1000:.0f} m "
+                          "(no baja en el terminal)")
 
     # --- Pareto: ningún alternativa domina a la primera; sin duplicados dominados ---
     for j in js[1:]:

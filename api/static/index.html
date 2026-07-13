@@ -172,20 +172,28 @@
           <p id="feed-note" class="brand__sub" style="margin:0"></p>
         </section>
 
+        <!-- Ajustes de búsqueda: colapsa perfil/modos/alternativas/CSA. Solo móvil. -->
+        <button class="btn btn--ghost btn--sm btn--block settings-toggle" id="btn-mobile-settings"
+                aria-expanded="false" aria-controls="modes-section">
+          <svg class="icon"><use href="#i-balanced"></use></svg>
+          Ajustes de búsqueda
+          <svg class="icon chevron"><use href="#i-chevron"></use></svg>
+        </button>
+
         <!-- Perfil -->
-        <section class="section" aria-label="Perfil de optimización">
+        <section class="section mcfg" aria-label="Perfil de optimización">
           <h2 class="section__title">Perfil</h2>
           <div id="profiles" class="profiles" role="group" aria-label="Perfil de optimización"></div>
         </section>
 
         <!-- Modos -->
-        <section class="section" id="modes-section" aria-label="Modos de transporte">
+        <section class="section mcfg" id="modes-section" aria-label="Modos de transporte">
           <h2 class="section__title">Modos de transporte</h2>
           <div id="modes" class="modes-grid"></div>
         </section>
 
         <!-- Búsqueda -->
-        <section class="section">
+        <section class="section mcfg">
           <h2 class="section__title">Alternativas</h2>
           <div class="field">
             <input id="num_alternatives" class="input" type="number" min="1" max="10" value="5"
@@ -195,7 +203,7 @@
 
         <!-- Panel modo único -->
         <div id="single-panel">
-          <details class="accordion" id="advanced">
+          <details class="accordion mcfg" id="advanced">
             <summary>
               <svg class="icon"><use href="#i-info"></use></svg>
               Opciones avanzadas (CSA)
@@ -257,6 +265,10 @@
         <svg class="icon"><use href="#i-pin"></use></svg>
         Elige origen y destino, luego pulsa «Planificar».
       </div>
+
+      <button class="map-back" id="btn-back-results" aria-label="Volver a los resultados">
+        <svg class="icon"><use href="#i-chevron"></use></svg> Resultados
+      </button>
 
       <div class="map-overlay" id="map-overlay" aria-hidden="true">
         <div class="map-overlay__box">

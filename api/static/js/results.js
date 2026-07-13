@@ -6,8 +6,9 @@ import {
   fmtTime, segTitle, _transitColor, altNames,
 } from "./format.js";
 import {
-  clearJourneys, addJourneyLayer, setActiveJourney, fitToJourneys, renderLegend,
+  clearJourneys, addJourneyLayer, setActiveJourney, fitToJourneys, fitJourney, renderLegend,
 } from "./map.js";
+import { isMobileSheet, revealMapForResult, hideMapBack } from "./ui/sheet.js";
 import { inputCoords } from "./coords.js";
 import { $, svgIcon } from "./dom.js";
 
@@ -127,6 +128,7 @@ export function renderGroups(groups) {
   const root = $("results");
   root.innerHTML = "";
   clearJourneys();
+  hideMapBack(); // limpia el botón "volver" de una búsqueda anterior
 
   const total = groups.reduce((n, g) => n + g.journeys.length, 0);
   const onlyWalk =
@@ -134,6 +136,9 @@ export function renderGroups(groups) {
     groups.every((g) => g.journeys.every((j) => j.segments.every((s) => s.type === "walk")));
 
   toggleActions(total > 0);
+  // Con resultados a la vista, el globo de ayuda ya no aplica (cúbrelo aunque el
+  // O/D se haya fijado escribiendo coordenadas, no solo por tap/geocoder).
+  if (total > 0) { const hint = $("map-hint"); if (hint) hint.style.display = "none"; }
 
   if (total === 0 || onlyWalk) {
     const msg =
@@ -231,6 +236,12 @@ export function renderGroups(groups) {
         } else {
           card.classList.add("active");
           setActiveJourney(layerIdx);
+          // En móvil: baja el panel para ver la ruta y encuádrala dejando hueco
+          // abajo para el sheet; el botón "Resultados" devuelve el panel.
+          if (isMobileSheet()) {
+            revealMapForResult();
+            fitJourney(layerIdx, { paddingTopLeft: [30, 70], paddingBottomRight: [30, 200] });
+          }
         }
       };
       card.addEventListener("click", activate);

@@ -628,13 +628,18 @@ class ConnectionScanAlgorithm:
                 if v is not None and v > eff_margin:
                     eff_margin = v
 
+        # Filter-then-rank: traer TODAS las paradas dentro del radio (cota alta,
+        # inalcanzable dentro de un margen peatonal) y filtrar DESPUÉS por modo.
+        # Truncar por proximidad antes de filtrar dejaba fuera estaciones de
+        # metro/tren útiles en zonas densas de paraderos de bus.
         pool = self.gtfs.get_nearby_stops(
-            coords, margin_km=eff_margin, max_stops=max(max_stops * 5, 40)
+            coords, margin_km=eff_margin, max_stops=1_000_000
         )
-        # _stop_to_routes_filtered ya contiene solo rutas de modos permitidos.
-        filtered = [
-            (sid, d) for sid, d in pool if self._get_routes_at_stop(sid)
-        ]
+        # Candidatura por PERTENENCIA DE MODO (no abordabilidad): la plataforma
+        # terminal de una línea de metro es la última parada de todo trip, así que
+        # no tiene ruta abordable en _stop_to_routes, pero es un egreso válido.
+        # gtfs.stop_modes incluye terminales; _get_routes_at_stop (abordar) no.
+        filtered = [(sid, d) for sid, d in pool if self._stop_mode_allowed(sid)]
         # Si el filtro deja todo vacío, devolver el pool acotado (find_journey
         # ya maneja el caso de no encontrar viajes y cae a caminata directa).
         if not filtered:
@@ -652,6 +657,31 @@ class ConnectionScanAlgorithm:
         if cfg.allowed_modes is not None and mode not in cfg.allowed_modes:
             return False
         return True
+
+    def _stop_mode_allowed(self, stop_id: str) -> bool:
+        """¿La parada es servida por algún modo permitido? (incluye terminales).
+
+        Análogo a ``_mode_allowed`` pero a nivel de PARADA, usando el índice
+        ``gtfs.stop_modes`` (que incluye la última parada de cada trip). Se usa
+        para seleccionar paradas de acceso/egreso bajo filtro de modo, sin exigir
+        que la ruta sea *abordable* allí (el terminal de una línea no lo es, pero
+        sirve como egreso). Si el índice no existe (gtfs stub), cae al criterio de
+        abordabilidad para no romper.
+        """
+        cfg = self.config
+        modes = getattr(self.gtfs, "stop_modes", None)
+        if modes is None:
+            return bool(self._get_routes_at_stop(stop_id))
+        stop_ms = modes.get(stop_id)
+        if not stop_ms:
+            return False
+        for m in stop_ms:
+            if cfg.excluded_modes and m in cfg.excluded_modes:
+                continue
+            if cfg.allowed_modes is not None and m not in cfg.allowed_modes:
+                continue
+            return True
+        return False
 
     def _is_transfer_viable(self, from_route: str, stop_id: str, to_route: str) -> bool:
         if not self.transfer_manager:
