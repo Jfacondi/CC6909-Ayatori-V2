@@ -43,6 +43,14 @@ KNOWN_MODES = (
     "funicular",
 )
 
+# Modos de riel (estación fija): son el destino/origen "útil" de un viaje y en
+# estaciones intermodales quedan rodeados de paraderos de bus más cercanos que
+# los desplazan del top-N de acceso/egreso. Ver _candidate_stops.
+_RAIL_MODES = frozenset({"metro", "rail", "tram"})
+# Cuántas plataformas de riel garantizar como candidatas cuando el top-N quedó
+# 100 % bus (2 sentidos por estación → cubre ~2 estaciones cercanas).
+_RAIL_ACCESS_SLOTS = 4
+
 # Sesgo por defecto de "prefer_rail": penaliza (en costo, no en tiempo) abordar
 # bus y favorece metro/tren. Solo afecta el ranking final, no la búsqueda.
 _PREFER_RAIL_TRANSFER_PENALTY = {
@@ -610,9 +618,23 @@ class ConnectionScanAlgorithm:
         cfg = self.config
         filters_active = cfg.allowed_modes is not None or bool(cfg.excluded_modes)
         if not filters_active:
-            return self.gtfs.get_nearby_stops(
+            near = self.gtfs.get_nearby_stops(
                 coords, margin_km=margin_km, max_stops=max_stops
             )
+            # La densidad de paraderos de bus en estaciones intermodales puede
+            # empujar la plataforma de metro/tren fuera del top-N, forzando al
+            # motor a "entrar/salir" de la estación con un bus-hop + footpath
+            # espurios (caso Los Libertadores→JGM: el metro quedaba en el rank
+            # 12 tras 8 paraderos de bus a <72 m). Si ninguna candidata es de
+            # riel, se inyectan las estaciones de riel más cercanas dentro del
+            # mismo margen peatonal, sin ampliar la densidad de bus del pool.
+            if near and not any(self._is_rail_stop(sid) for sid, _ in near):
+                pool = self.gtfs.get_nearby_stops(
+                    coords, margin_km=margin_km, max_stops=1_000_000
+                )
+                rail = [(sid, d) for sid, d in pool if self._is_rail_stop(sid)]
+                near = near + rail[:_RAIL_ACCESS_SLOTS]
+            return near
 
         # Budget de acceso ampliado por modo (opt-in): permite alcanzar
         # estaciones de metro/tren más lejanas que la parada de bus más cercana.
@@ -657,6 +679,18 @@ class ConnectionScanAlgorithm:
         if cfg.allowed_modes is not None and mode not in cfg.allowed_modes:
             return False
         return True
+
+    def _is_rail_stop(self, stop_id: str) -> bool:
+        """¿La parada la sirve algún modo de riel (metro/tren/tranvía)?
+
+        Usa ``gtfs.stop_modes`` (incluye terminales, que no tienen ruta
+        abordable pero sí son estación). Independiente de filtros de modo.
+        """
+        modes = getattr(self.gtfs, "stop_modes", None)
+        if not modes:
+            return False
+        stop_ms = modes.get(stop_id)
+        return bool(stop_ms) and not stop_ms.isdisjoint(_RAIL_MODES)
 
     def _stop_mode_allowed(self, stop_id: str) -> bool:
         """¿La parada es servida por algún modo permitido? (incluye terminales).
