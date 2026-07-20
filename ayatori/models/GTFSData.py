@@ -980,8 +980,6 @@ class GTFSData:
                         "sequence": st.stop_sequence,
                     }
 
-        print("GTFS DATA RECEIVED SUCCESSFULLY")
-
     def get_stop_ids(self):
         stop_set = set()
         for route_id, stops in self.route_stops.items():

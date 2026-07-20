@@ -17,7 +17,7 @@ OSM (pbf) ───┘                        │                       │
 git clone <repo> && cd CC6909-Ayatori-V2
 python -m venv .venv && . .venv/Scripts/activate     # Windows
 # . .venv/bin/activate                                # Linux/macOS
-pip install -e ".[api,viz]"
+pip install -e ".[api,geo]"
 ```
 
 Requiere Python ≥ 3.10. Para soporte OSM, instalar el extra `geo` (`osmium`): tiene wheel en Windows (`pip install osmium`), por lo que ya no requiere conda.
@@ -75,11 +75,10 @@ csa = ConnectionScanAlgorithm(gtfs, transfer_manager=tm, config=cfg)
 
 ### Visualización
 
-```python
-from ayatori.visualization import visualize_journeys
-m = visualize_journeys(journeys, gtfs_data=gtfs)
-m.save("viaje.html")
-```
+La visualización de itinerarios vive en el **frontend web** (ver [Uso por API](#uso-por-api-docker)):
+cada viaje se dibuja sobre el mapa con las *shapes* reales del GTFS, caminatas punteadas y
+transbordos con ícono. El antiguo módulo de visualización sobre Folium para notebooks fue
+reemplazado por el frontend.
 
 ---
 
@@ -137,7 +136,6 @@ AYATORI_USE_OSM=1 \
 | `GTFSData` | `ayatori/models/GTFSData.py` | Lectura del feed, índices espaciales (cKDTree) y por ruta, walking time, caché de transferencias |
 | `TransferManager` | `ayatori/models/TransferConnection.py` | Persistencia y consulta O(1) de transferencias precomputadas |
 | `ConnectionScanAlgorithm` | `ayatori/models/ConnectionScanAlgorithm.py` | Motor de ruteo multi-target con Dijkstra + Pareto |
-| `JourneyPlannerV2` | `ayatori/models/JourneyPlannerV2.py` | Wrapper de alto nivel orientado a casos de uso |
 | `OSMGraph` | `ayatori/models/OSMGraph.py` | Red peatonal opcional (rustworkx, requiere osmium) |
 | `api/` | `api/main.py`, `api/schemas.py` | FastAPI + Pydantic |
 | `api/static/` | `index.html`, `js/` (módulos), `css/` | Frontend Leaflet (sin build step) |
@@ -148,8 +146,7 @@ AYATORI_USE_OSM=1 \
 
 El motor combina varias técnicas. El **detalle de implementación de cada una**
 (dónde vive, estructuras de datos, paso a paso, complejidad) está en
-[`docs/ARQUITECTURA.md` §4](docs/ARQUITECTURA.md); los flujos con diagramas, en
-[`docs/MAPA_IMPLEMENTACION.md`](docs/MAPA_IMPLEMENTACION.md).
+[`docs/ARQUITECTURA.md` §4](docs/ARQUITECTURA.md).
 
 | Algoritmo / técnica | Dónde | Para qué |
 |---|---|---|
@@ -184,4 +181,4 @@ Tipos: `mypy` configurado en modo permisivo en `ayatori/`, estricto en `api/`.
 
 ## Roadmap
 
-Trabajo pendiente para el cierre de la memoria en [`todo.md`](todo.md). El planificador `JourneyPlanner` (V1) fue removido; el motor es `ConnectionScanAlgorithm`, con `JourneyPlannerV2` como wrapper de alto nivel.
+El planificador `JourneyPlanner` (V1) original fue removido; el motor de ruteo es `ConnectionScanAlgorithm`. El trabajo futuro se detalla en el capítulo de conclusiones de la memoria.
